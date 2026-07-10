@@ -5,6 +5,11 @@ These values MUST match the #define values in c/include/polctrl.h.
 Tested by test_parity_c_vs_python.py.
 """
 
+from fixedpoint import FP_SHIFT, FP_ONE, FP_MAX, FP_MIN
+
+# === Fixed-point format (mirrors c/include/fixedpoint.h) ===
+# Q8.8 on int16_t: range +/-127.996, resolution 1/256 ~= 0.0039
+
 # === Physical ranges ===
 NUM_SECTIONS = 4
 

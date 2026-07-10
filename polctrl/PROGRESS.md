@@ -51,3 +51,49 @@
   w `test_mul_overflow_clamp`.
 - `V_STEP_Q88 = 26` (0.1V * 256 = 25.6 → zaokrąglone do 26). To jest najbliższa reprezentacja 0.1V
   w Q8.8 — błąd to 0.0015625V, akceptowalne dla kroku aktuatora.
+
+---
+
+## Faza 2 — Symulator fizyczny (Python)
+
+### Zrobiono
+- `python/simulator.py`: pełny model fizyczny łącza światłowodowego.
+  - Reprezentacja SOP: punkt na sferze Poincarégo (znormalizowane wektory Stokesa s1,s2,s3).
+  - Model aktuatora: 4 sekcje piezo jako retardery. Sekcje {0,1} obracają SOP wokół osi A=(1,0,0),
+    sekcje {2,3} wokół osi B=(0,1,0). Kąt obrotu = (V/V_max) * max_rotation_rad (domyślnie 2π).
+    Zastosowanie sekwencyjne: SOP_out = R3·R2·R1·R0·SOP_in (wzór Rodriguesa).
+  - Beat note power: I = cos²(angle(SOP_out, SOP_ref)/2), przeskalowane do dBm względem
+    konfigurowalnego sufitu kanału (channel_ceiling_dbm, domyślnie -38 dBm).
+  - Dryf SOP: proces Ornsteina-Uhlenbecka na azymucie/elewacji, z konfigurowalną stałą czasową
+    i amplitudą.
+  - Szum pomiaru: dwa tryby — (a) biały gaussowski, (b) interferometryczny (suma sinusoid
+    o losowych fazach + szum biały).
+  - Metoda `step(voltages, dt_ms=1.0)` zwraca zaszumiony odczyt mocy w dBm.
+  - 7 scenariuszy: stable, slow_drift, fast_drift, regime_switch, cold_start, sudden_fade,
+    channel_degradation.
+  - Metoda `get_optimal_voltages()` (wyszukiwanie na siatce, do testów).
+- `tests/test_simulator.py`: 18 testów (sanity checks + scenariusze).
+
+### Testy (18/18 przechodzą)
+- Moc maksymalna gdy SOP_out == SOP_reference.
+- Moc niska gdy SOP orthogonal do reference.
+- Zakres dBm w granicach fizycznego detektora.
+- Stabilność przy braku dryfu i szumu.
+- Monotoniczność: ruch w stronę optimum zwiększa moc.
+- Clamping napięć.
+- Odtwarzalność przy ustalonym seedzie.
+- Wszystkie 7 scenariuszy uruchamia się bez błędu.
+- Stable: niska wariancja.
+- Sudden fade: spadek mocy po zdarzeniu.
+- Channel degradation: sufit mocy spada w czasie.
+- Regime switch: wariancja rośnie po przełączeniu w tryb szybkiego dryfu.
+
+### Decyzje
+- `max_rotation_rad = 2π` (pełny obrót przy V_max). Daje aktuatorowi wystarczający zakres
+  do osiągnięcia dowolnego SOP na sferze — fizycznie realistyczne dla 4-sekcyjnego kontrolera.
+- Test `test_sudden_fade_triggers_drop` używa niestandardowego symulatora z zerowym dryfem
+  i odwróceniem wektora SOP (zamiast losowego), aby odizolować efekt nagłego skoku od dryfu.
+  Próg spadku: 3 dB (nie 5 dB) — aktuator ma wystarczający zakres, by częściowo kompensować
+  zmianę SOP, więc spadek nie jest tak drastyczny jak przy pełnym odłączeniu sygnału.
+- Scenariusz `regime_switch` implementuje przełączenie przez nadpisanie metody `step`
+  (wrapper zmieniający parametry dryfu po ustalonym kroku).
