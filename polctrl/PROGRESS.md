@@ -180,3 +180,26 @@
   nie być dokładnie na gridu. Testy akceptują theta==V_MAX_Q88 jako wyjątek.
 - Q-value update z cap 255 na effective count (powyżej 255, alpha=0, Q zbiegałe).
 - Bandit LUT generowany offline w Pythonie, embedowany jako stała tablica w C.
+
+---
+
+## Faza 6 — Testy parytetu C vs Python (KRYTYCZNE)
+
+### Zrobiono
+- `python/reference_impl.py`: czysto-pythonowa transliteracja logiki rdzenia C,
+  używająca `fixedpoint.py` do całej arytmetyki (bez float/double).
+  - Implementuje: rng (xorshift32), baseline, FSM, SPSA, bandyta, polctrl_step.
+  - Ten sam algorytm PRNG w obu językach (ręczna implementacja, nie `random`/`numpy.random`).
+- `tests/test_parity_c_vs_python.py`: 28 testów parytetu.
+  - Struct sizeof: 8 testów (ctypes vs C sizeof).
+  - Stałe: 14 testów (parsowanie `#define` z `polctrl.h` vs `constants.py`).
+  - RNG: 1 test (1000 wywołań, identyczna sekwencja).
+  - Trajektoria: 2 testy (10000 kroków z losowymi wejściami, 2000 kroków z symulatorem).
+  - Moduły: 4 testy (baseline_update, fsm_update, bandit_select, isqrt).
+
+### Wynik
+- **Wszystkie 28 testów parytetu przechodzi.**
+- Trajektorie `theta` bit-dokładnie identyczne między C a Python po 10000 kroków.
+- Każda rozbieżność byłaby bugiem — nie znaleziono żadnej.
+
+### Łącznie testów: 116/116 przechodzi.

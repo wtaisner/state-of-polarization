@@ -100,11 +100,22 @@ BEATNOTE_OFFSET = 65  # dBm offset: internal = (dBm + 65) * 256
 # These are initial guesses; tuned empirically in Phase 8.
 # Values in Q8.8.
 # Format: (a_gain_q88, c_gain_q88)
+
+# Individual arm constants (must match c/include/polctrl.h)
+ARM0_A_Q88 = 1 * FP_ONE    # 256
+ARM0_C_Q88 = 1 * FP_ONE    # 256
+ARM1_A_Q88 = 1 * FP_ONE    # 256
+ARM1_C_Q88 = 4 * FP_ONE    # 1024
+ARM2_A_Q88 = 4 * FP_ONE    # 1024
+ARM2_C_Q88 = 1 * FP_ONE    # 256
+ARM3_A_Q88 = 4 * FP_ONE    # 1024
+ARM3_C_Q88 = 4 * FP_ONE    # 1024
+
 ARM_PROFILES = [
-    (1 * 256, 1 * 256),    # Arm 0: small a, small c (conservative)
-    (1 * 256, 4 * 256),    # Arm 1: small a, large c (cautious explore)
-    (4 * 256, 1 * 256),    # Arm 2: large a, small c (aggressive exploit)
-    (4 * 256, 4 * 256),    # Arm 3: large a, large c (aggressive explore)
+    (ARM0_A_Q88, ARM0_C_Q88),    # Arm 0: small a, small c (conservative)
+    (ARM1_A_Q88, ARM1_C_Q88),    # Arm 1: small a, large c (cautious explore)
+    (ARM2_A_Q88, ARM2_C_Q88),    # Arm 2: large a, small c (aggressive exploit)
+    (ARM3_A_Q88, ARM3_C_Q88),    # Arm 3: large a, large c (aggressive explore)
 ]
 
 # === SEARCH mode gain profile (overrides bandit) ===
