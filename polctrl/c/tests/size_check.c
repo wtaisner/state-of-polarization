@@ -1,0 +1,18 @@
+/*
+ * size_check.c — helper binary printing sizeof of all public structures.
+ * Used by test_parity_c_vs_python.py to verify ctypes layout matches C.
+ */
+#include <stdio.h>
+#include "polctrl.h"
+#include "fixedpoint.h"
+#include "polctrl_internal.h"
+
+int main(void) {
+    printf("sizeof(fp_t) = %zu\n", sizeof(fp_t));
+    printf("sizeof(PolCtrlOutput) = %zu\n", sizeof(PolCtrlOutput));
+    printf("sizeof(PolCtrlState) = %zu\n", sizeof(PolCtrlState));
+    printf("FP_SHIFT = %d\n", FP_SHIFT);
+    printf("FP_ONE = %d\n", FP_ONE);
+    printf("NUM_SECTIONS = %d\n", NUM_SECTIONS);
+    return 0;
+}

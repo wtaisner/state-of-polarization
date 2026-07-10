@@ -1,0 +1,19 @@
+# Build artifacts
+*.so
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Generated outputs
+scripts/output/*.png
+
+# IDE
+.idea/
+
+# OS
+.DS_Store
