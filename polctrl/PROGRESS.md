@@ -203,3 +203,29 @@
 - Każda rozbieżność byłaby bugiem — nie znaleziono żadnej.
 
 ### Łącznie testów: 116/116 przechodzi.
+
+---
+
+## Faza 7 — README_HAL.md
+
+### Zrobiono
+- Pełna dokumentacja kontraktu API dla elektronika w `README_HAL.md` (po polsku).
+- Opisuje: inicjalizację, pętlę 1ms, jednostki wejściowe/wyjściowe (dokładne wzory),
+  wymagania pamięciowe, kompilację pod AVR64DB, diagram przepływu, szybki test na PC.
+
+## Faza 8 — scenario_runner.py
+
+### Zrobiono
+- `scripts/scenario_runner.py`: uruchamia pełny stack (symulator + skompilowane C)
+  na wszystkich 7 scenariuszach, generuje wykresy (moc, napięcia, FSM, bandyta).
+- Wyniki zapisane w `scripts/output/*.png`.
+
+### Obserwacje jakościowe
+- **stable**: mean=-39.9 dBm (blisko sufitu -38), niski ruch (124.9V), głównie TRACK.
+  Dead-zone działa — kontroler nie rusza aktuatorem niepotrzebnie.
+- **slow_drift**: mean=-41.8, umiarkowany ruch, trochę SEARCH — kontroler podąża za dryfem.
+- **fast_drift**: mean=-42.1, duży ruch (3619V), więcej SEARCH/RECOVERY — agresywniejsze sterowanie.
+- **regime_switch**: pierwsza połowa spokojna, druga agresywna — bandyta adaptuje.
+- **cold_start**: SEARCH na starcie (1465 kroków), potem odzyskuje sygnał.
+- **sudden_fade**: SEARCH wyzwolony po nagłym skoku, częściowe odzyskanie.
+- **channel_degradation**: moc spada w czasie (mean=-51.1), baseline adaptuje się w dół.
