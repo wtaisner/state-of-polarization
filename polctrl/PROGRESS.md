@@ -97,3 +97,86 @@
   zmianę SOP, więc spadek nie jest tak drastyczny jak przy pełnym odłączeniu sygnału.
 - Scenariusz `regime_switch` implementuje przełączenie przez nadpisanie metody `step`
   (wrapper zmieniający parametry dryfu po ustalonym kroku).
+
+---
+
+## Faza 3 (3a-3g) — Rdzeń algorytmu w portable C
+
+### Zrobiono
+
+**3a: Stałe i typy (`polctrl.h`, `polctrl_internal.h`)**
+- Wszystkie stałe numeryczne zdefiniowane jako `#define` w `polctrl.h`, odpowiadające `python/constants.py`.
+- `PolCtrlOutput`: struktura wyjściowa (actuate flag + 4 napięcia Q8.8).
+- `PolCtrlState`: pełny stan kontrolera (244 bajty), zawiera stany wszystkich podmodułów.
+- Jednostka wewnętrzna: `beatnote_reading = (dBm + 65) * 256`, zakres [0, 7680].
+- Napięcia w Q8.8 wprost jako wolty: 0V → 0, 60V → 15360.
+
+**3b: Adaptacyjny baseline (`baseline.c`)**
+- `BaselineState`: baseline, noise_sigma, y_fast (EMA τ=8ms), y_slow (EMA τ=75ms), initialized, warmup_counter.
+- `baseline_update`: aktualizuje EMAs, baseline (szybki wzrost, powolny spadek), sigma (tylko w dead-zone).
+- `baseline_zscore`: (baseline - y_slow) / max(sigma, eps). Podczas cold-start zwraca FP_MAX (wymusza SEARCH).
+- **Decyzja**: sigma estymowana jako EMA z |y_raw - y_slow| (zamiast |y_fast - y_slow| z propozycji specyfikacji).
+  Uzasadnienie: |y_raw - y_slow| jest znacznie lepszym estymatorem szumu (std ≈ 0.99 * sigma_true)
+  w porównaniu do |y_fast - y_slow| (std ≈ 0.26 * sigma_true). Dokumentowane jako świadoma zmiana.
+- **Decyzja**: cold-start inicjalizuje baseline po ustalonej liczbie iteracji (COLD_START_WARMUP=200),
+  zamiast czekać na plateau z gradientu. Uproszczenie dopuszczone w specyfikacji.
+
+**3c: Dead-zone i SEARCH (`fsm.c`, część 1)**
+- `FsmState`: mode (TRACK/SEARCH/RECOVERY), consecutive_good_windows, periodic_probe_counter.
+- `fsm_update`: przejścia TRACK↔SEARCH↔RECOVERY z histerezą (HYSTERESIS_WINDOWS=5).
+- Nagła detekcja spadku: y_fast < 0.75 * y_slow → SEARCH (niezależne od z-score).
+- `fsm_should_actuate`: 1 jeśli zscore > k1 (2.5 sigma) lub w SEARCH.
+- `fsm_check_periodic_probe`: wymusza SPSA co PERIODIC_PROBE_INTERVAL (30000) próbek, nieaktywne w SEARCH.
+
+**3d: SPSA (`spsa.c`)**
+- `SpsaState`: theta[4], last_grad_estimate[4], rng, delta[4], c_k[4].
+- `boundary_weight`: 1.0 w środku, liniowo maleje do 0.2 (BOUNDARY_FLOOR_WEIGHT) na brzegach.
+- `forced_inward_sign`: +1 poniżej 2V, -1 powyżej 58V, 0 w środku.
+- `spsa_compute_probe`: losuje delta, liczy theta_plus/theta_minus z wagami brzegowymi.
+  Możliwość wyłączenia wag brzegowych (dla SEARCH).
+- `spsa_apply_result`: ĝ = (y_plus - y_minus) / (2 * c_k * delta), theta += a * ĝ, clamp, snap do gridu.
+  Gradient clamp ±4.0, zabezpieczenie przed przepełnieniem fp_div.
+- `snap_to_voltage_grid`: zaokrągla do najbliższego 0.1V (V_STEP_Q88=26), clamp do [0, 60].
+
+**3e: Kompletny FSM (`fsm.c`, część 2)**
+- `fsm_gain_for_mode`: SEARCH → SEARCH_GAIN_PROFILE (a=8V, c=8V), TRACK/RECOVERY → bandit profile.
+
+**3f: Kontekstowy bandyta (`bandit.c`)**
+- `BanditState`: q_value[6][4], count[6][4], total_count.
+- `discretize_context`: 3 poziomy dryfu × 2 poziomy szumu = 6 koszyków.
+- `bandit_select_arm`: UCB1 z LUT dla sqrt(ln(N+1)) i isqrt dla sqrt(n+1).
+  LUT: 128 wpisów, generowany przez `scripts/generate_lut.py`.
+- `bandit_update`: EMA z alpha = 1/min(count, 255) (cap na 255 dla uniknięcia utraty precyzji).
+- `ARM_PROFILES`: 4 profile (kombinacje a∈{1,4}V × c∈{1,4}V).
+
+**3g: Publiczne API (`polctrl.c`)**
+- `polctrl_init(rng_seed)`: inicjalizuje wszystkie podmoduły, theta=30V, rng=xorshift32.
+- `polctrl_step(state, beatnote, &out)`: główna pętla 1ms.
+  - Aktualizuje baseline, liczy z-score, aktualizuje FSM.
+  - Wewnętrzny automat SPSA: IDLE → SET_PLUS → MEASURE_PLUS → SET_MINUS → MEASURE_MINUS → APPLY → IDLE.
+  - Czas trwania rundy SPSA: ~456 próbek (2×225 settle + 6 przejść) ≈ 0.46s.
+  - Bandit aktualizowany co BANDIT_WINDOW_ITERATIONS (50) rund SPSA.
+  - Reward: mean(y_slow) - LAMBDA*boundary_fraction - MU*movement.
+- HAL musi implementować tylko: timer 1ms → ADC → polctrl_step → DAC (gdy actuate==1).
+
+### Faza 4 — Bindings ctypes (`python/bindings.py`)
+- Wszystkie struktury C zdefiniowane jako `ctypes.Structure` z zgodnym layoutem.
+- `polctrl_init`, `polctrl_step` oraz funkcje wszystkich podmodułów eksportowane.
+- Wszystkie sizeof() struktur Python == C (test parytetu).
+
+### Faza 5 — Testy (88/88 przechodzą)
+- `test_fixedpoint.py`: 22 testy (Python + parytet C).
+- `test_simulator.py`: 18 testów (sanity + scenariusze).
+- `test_baseline.py`: 7 testów (init, cold-start, fast-rise, slow-fall, sigma).
+- `test_fsm.py`: 11 testów (przejścia, histereza, sudden-fade, periodic probe).
+- `test_spsa_core.py`: 16 testów (boundary weight, forced inward, grid, convergence, fuzz).
+- `test_bandit.py`: 14 testów (discretize, UCB1 convergence, overflow, independence).
+- `run_all_tests.sh`: build C + pytest + grep (float/double/malloc).
+
+### Decyzje
+- Zmiana estymatora sigma: |y_raw - y_slow| zamiast |y_fast - y_slow| (uzasadnienie wyżej).
+- `snap_to_voltage_grid` dodatkowo clampuje do [V_MIN, V_MAX].
+- V_MAX_Q88 (15360) nie jest wielokrotnością V_STEP_Q88 (26) — wartości na granicy mogą
+  nie być dokładnie na gridu. Testy akceptują theta==V_MAX_Q88 jako wyjątek.
+- Q-value update z cap 255 na effective count (powyżej 255, alpha=0, Q zbiegałe).
+- Bandit LUT generowany offline w Pythonie, embedowany jako stała tablica w C.

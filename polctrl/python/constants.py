@@ -42,6 +42,10 @@ K1_DEADZONE_DEN = 2
 K2_SEARCH_NUM = 8      # k2 = 8/1 = 8.0
 K2_SEARCH_DEN = 1
 
+# Precomputed Q8.8 values
+K1_DEADZONE_Q88 = round((K1_DEADZONE_NUM / K1_DEADZONE_DEN) * FP_ONE)  # 640
+K2_SEARCH_Q88 = round((K2_SEARCH_NUM / K2_SEARCH_DEN) * FP_ONE)       # 2048
+
 # === Hysteresis ===
 HYSTERESIS_WINDOWS = 5   # Consecutive good windows to exit SEARCH -> TRACK
 
@@ -61,9 +65,11 @@ COLD_START_WARMUP = 200   # Iterations before baseline is initialized
 
 # === Boundary zone (actuator edge avoidance) ===
 BOUNDARY_MARGIN_VOLT = 5         # Below 5V from 0 or 60, damping starts
+BOUNDARY_MARGIN_Q88 = round(BOUNDARY_MARGIN_VOLT * 256)  # 1280
 BOUNDARY_FLOOR_WEIGHT = 0.2      # Minimum weight at edges -> Q8.8: 51
 BOUNDARY_FLOOR_WEIGHT_Q88 = round(BOUNDARY_FLOOR_WEIGHT * 256)  # 51
 BOUNDARY_FORCE_INWARD_VOLT = 2   # Below this margin, force inward direction
+BOUNDARY_FORCE_INWARD_Q88 = round(BOUNDARY_FORCE_INWARD_VOLT * 256)  # 512
 
 # === Periodic probe (exploration ping in dead-zone) ===
 # Once every ~30 seconds at 1ms sampling
@@ -80,9 +86,15 @@ BANDIT_WINDOW_ITERATIONS = 50
 C_EXPLORE = 2   # In Q8.8: 2.0 * 256 = 512
 C_EXPLORE_Q88 = 512
 
-# Reward shaping weights
-LAMBDA_BOUNDARY = 1   # Weight for boundary proximity penalty
-MU_MOVEMENT = 1       # Weight for movement penalty
+# Reward shaping weights (Q8.8)
+LAMBDA_BOUNDARY_Q88 = 1 * FP_ONE   # 1.0
+MU_MOVEMENT_Q88 = 1 * FP_ONE       # 1.0
+
+# SPSA settle samples (3 * TAU_SLOW_MS for 95% EMA settling)
+SPSA_SETTLE_SAMPLES = 3 * TAU_SLOW_MS  # 225
+
+# Beatnote offset for internal unit
+BEATNOTE_OFFSET = 65  # dBm offset: internal = (dBm + 65) * 256
 
 # === SPSA gain profiles (a_gain, c_gain) for each arm ===
 # These are initial guesses; tuned empirically in Phase 8.
