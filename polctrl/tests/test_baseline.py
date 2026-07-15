@@ -8,8 +8,6 @@ import ctypes
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
-
 from bindings import get_lib, BaselineState
 import fixedpoint as fp
 

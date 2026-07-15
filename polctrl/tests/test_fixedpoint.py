@@ -11,9 +11,6 @@ import struct
 
 import pytest
 
-# Add python/ to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
-
 import fixedpoint as fp
 
 # Build libpolctrl.so if needed

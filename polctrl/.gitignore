@@ -9,6 +9,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
+# uv
+.venv/
+
 # Generated outputs
 scripts/output/*.png
 

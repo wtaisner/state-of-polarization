@@ -3,7 +3,7 @@ scenario_runner.py — Run the full stack (simulator + C controller) on all
 scenarios from Phase 2, generating plots for visual inspection.
 
 Usage:
-    python3 scripts/scenario_runner.py
+    uv run python scripts/scenario_runner.py
 
 Outputs:
     scripts/output/*.png — plots for each scenario
@@ -19,11 +19,6 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 
-# Add project paths
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
-sys.path.insert(0, os.path.join(PROJECT_DIR, 'python'))
-
 from bindings import polctrl_init, polctrl_step, PolCtrlOutput
 from simulator import (
     PolarizationSimulator,
@@ -34,6 +29,7 @@ from simulator import (
 import fixedpoint as fp
 from constants import NUM_SECTIONS, CHANNEL_CEILING_DBM
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

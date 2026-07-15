@@ -1,0 +1,30 @@
+[project]
+name = "polctrl"
+version = "0.1.0"
+description = "Polarization controller (SPSA + adaptive baseline + contextual bandit) for fiber-optic frequency transfer"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Install modules from python/ as top-level (e.g. `import bindings`, not `import python.bindings`)
+packages = ["python"]
+sources = ["python"]
+
+[tool.pytest.ini_options]
+pythonpath = ["python"]
+testpaths = ["tests"]
+
+[tool.uv]
+package = true

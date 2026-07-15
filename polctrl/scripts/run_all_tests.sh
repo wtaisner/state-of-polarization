@@ -3,9 +3,10 @@
 #
 # Includes:
 #   1. Build C library (libpolctrl.so)
-#   2. Run pytest test suite
-#   3. Grep checks: no float/double in algorithm core
-#   4. Grep checks: no malloc/free in algorithm core
+#   2. Sync uv environment
+#   3. Run pytest test suite
+#   4. Grep checks: no float/double in algorithm core
+#   5. Grep checks: no malloc/free in algorithm core
 #
 # Exit code 0 = all pass, non-zero = failure.
 
@@ -21,7 +22,7 @@ echo "========================================"
 
 # --- 1. Build C library ---
 echo ""
-echo "[1/4] Building libpolctrl.so..."
+echo "[1/5] Building libpolctrl.so..."
 cd "$C_DIR"
 make clean > /dev/null 2>&1
 make 2>&1
@@ -31,20 +32,30 @@ if [ $? -ne 0 ]; then
 fi
 echo "OK: C library built"
 
-# --- 2. Run pytest ---
+# --- 2. Sync uv environment ---
 echo ""
-echo "[2/4] Running pytest..."
+echo "[2/5] Syncing uv environment..."
 cd "$PROJECT_DIR"
-python3 -m pytest tests/ -v 2>&1
+uv sync --quiet 2>&1
+if [ $? -ne 0 ]; then
+    echo "FAIL: uv sync failed"
+    exit 1
+fi
+echo "OK: uv environment synced"
+
+# --- 3. Run pytest ---
+echo ""
+echo "[3/5] Running pytest..."
+uv run pytest tests/ -v 2>&1
 if [ $? -ne 0 ]; then
     echo "FAIL: pytest tests failed"
     exit 1
 fi
 echo "OK: All pytest tests passed"
 
-# --- 3. Grep: no float/double in algorithm core ---
+# --- 4. Grep: no float/double in algorithm core ---
 echo ""
-echo "[3/4] Checking for float/double in algorithm core..."
+echo "[4/5] Checking for float/double in algorithm core..."
 CORE_FILES="$C_DIR/src/baseline.c $C_DIR/src/spsa.c $C_DIR/src/fsm.c $C_DIR/src/bandit.c $C_DIR/src/polctrl.c"
 FLOAT_FOUND=0
 for f in $CORE_FILES; do
@@ -62,9 +73,9 @@ if [ $FLOAT_FOUND -ne 0 ]; then
 fi
 echo "OK: No float/double in algorithm core"
 
-# --- 4. Grep: no malloc/free in algorithm core ---
+# --- 5. Grep: no malloc/free in algorithm core ---
 echo ""
-echo "[4/4] Checking for malloc/free in algorithm core..."
+echo "[5/5] Checking for malloc/free in algorithm core..."
 MALLOC_FOUND=0
 for f in $CORE_FILES $C_DIR/src/fixedpoint.c $C_DIR/src/rng.c; do
     MATCHES=$(grep -nE '\b(malloc|calloc|realloc|free)\b' "$f" | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '/\*' || true)

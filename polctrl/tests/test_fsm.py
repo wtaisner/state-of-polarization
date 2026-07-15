@@ -7,8 +7,6 @@ import ctypes
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
-
 from bindings import get_lib, FsmState, STATE_TRACK, STATE_SEARCH, STATE_RECOVERY
 import fixedpoint as fp
 from constants import K1_DEADZONE_Q88, K2_SEARCH_Q88, HYSTERESIS_WINDOWS
