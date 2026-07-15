@@ -127,11 +127,20 @@ sudden-fade detector (§3.1).
 
 ### 2.3 Adaptive Ceiling: The Asymmetric Tracker
 
-The controller needs to know "what power level is achievable right now?" —
-the **ceiling**. This is not a fixed threshold; it changes as the channel
-degrades or as the controller finds better alignments.
+**What is the ceiling?** The **ceiling** is the best beat note power that the
+system could achieve right now if the polarization were perfectly aligned.
+It is *not* a known constant — it depends on the channel condition (laser
+power, connector quality, fiber bend loss, detector efficiency), all of which
+can change slowly over time. The controller doesn't know the ceiling; it must
+*estimate* it from the power readings.
 
-The ceiling $B$ is updated by an **asymmetric integrator**:
+Why does the controller need the ceiling? To decide whether the current power
+is "good" or "bad." A reading of −45 dBm might be excellent (if the ceiling
+is −44 dBm due to a degraded connector) or terrible (if the ceiling is −38
+dBm and the polarization is misaligned). Without knowing the ceiling, the
+controller can't tell the difference.
+
+The ceiling estimate $B$ is updated by an **asymmetric integrator**:
 
 $$B_{t+1} = \begin{cases} y_{\text{slow}}^{(t)} & \text{if } y_{\text{slow}}^{(t)} > B_t \quad \text{(rise: immediate)} \\ B_t - \delta & \text{otherwise} \quad \text{(fall: slow leak)} \end{cases}$$
 
@@ -139,13 +148,17 @@ where $\delta$ is a tiny constant (one least-significant-bit per sample).
 
 **Intuition:** "Believe good news immediately, be skeptical of bad news."
 
-- If the smoothed power *exceeds* the current ceiling, the controller has found
-  a better operating point. The ceiling snaps up instantly — there is no reason
-  to doubt an improvement.
-- If the smoothed power is *below* the ceiling, the ceiling doesn't drop to
-  meet it. Instead, it leaks downward at a glacial pace (~30 seconds per dBm).
-  This is because a dip could be transient (a fade that will recover) rather
-  than a genuine ceiling drop.
+- If the smoothed power *exceeds* the current ceiling estimate, the controller
+  has found a better operating point than it thought possible. The ceiling
+  snaps up instantly — there is no reason to doubt an improvement; the power
+  really was that high.
+- If the smoothed power is *below* the ceiling estimate, it could mean the
+  ceiling has dropped (channel degradation) *or* it could be a transient dip
+  (a fade that will recover). The ceiling doesn't drop to meet the signal.
+  Instead, it leaks downward at a glacial pace (~30 seconds per dBm). If the
+  dip is transient, the signal recovers before the ceiling has moved much, and
+  no false alarm is triggered. If the dip is permanent, the ceiling eventually
+  catches up.
 
 ```mermaid
 graph LR
@@ -244,16 +257,39 @@ which may be stale or unreliable during transients. The sudden-fade detector
 is a simple, robust heuristic that catches the most dangerous case (cable hit,
 connector disconnect) within milliseconds, without relying on sigma.
 
-### 3.2 Transitions
+### 3.2 Hysteresis
+
+**What is hysteresis?** Hysteresis is a mechanism where the threshold for
+*leaving* a state is stricter than the threshold for *entering* it, creating
+a buffer zone that prevents rapid oscillation.
+
+A familiar example is a thermostat: the heater turns on when the temperature
+drops below 18°C, but doesn't turn off until it reaches 21°C. Without this
+gap, the heater would rapidly toggle on and off when the temperature hovers
+near 18°C. The 3-degree buffer is the hysteresis.
+
+In our controller, the entry threshold for SEARCH is $z > 8\sigma$ (severe
+degradation), but the exit threshold is $z < 2.5\sigma$ (clear recovery). If
+the z-score bounces between 4 and 7 — degraded, but not catastrophic — the
+controller stays in SEARCH rather than rapidly toggling between SEARCH and
+TRACK. This is essential because each state change resets the optimization
+cycle, and rapid toggling would prevent any real progress.
+
+The RECOVERY → TRACK transition adds a *temporal* hysteresis on top: even
+after $z$ drops below 2.5σ, the controller requires **5 consecutive windows**
+of good signal before declaring "recovered." A single good reading isn't
+enough — the signal must prove stability over time.
+
+### 3.3 Transitions
 
 | Transition | Condition | Rationale |
 |------------|-----------|-----------|
 | TRACK → SEARCH | $z > 8\sigma$ or sudden fade | Severe degradation: abandon fine-tuning, search aggressively |
-| SEARCH → RECOVERY | $z < 2.5\sigma$ | Signal has recovered to the dead-zone |
-| RECOVERY → TRACK | 5 consecutive windows with $z < 2.5\sigma$ | Hysteresis: don't declare "recovered" until the signal has been stable for a while |
+| SEARCH → RECOVERY | $z < 2.5\sigma$ | Signal has recovered below the (lower) exit threshold — hysteresis prevents oscillation |
+| RECOVERY → TRACK | 5 consecutive windows with $z < 2.5\sigma$ | Temporal hysteresis: require sustained recovery, not just a single good reading |
 | RECOVERY → SEARCH | $z > 8\sigma$ | Regression: the recovery didn't hold |
 
-### 3.3 Dead-Zone Gate
+### 3.4 Dead-Zone Gate
 
 The **dead-zone** is the core mechanism for minimizing unnecessary actuator
 movement. The optimizer is only allowed to actuate when:
@@ -264,7 +300,7 @@ When in the dead-zone, the controller does nothing — it only monitors. This
 is by design: every piezo movement introduces phase noise, so the best move
 is no move when the signal is already good.
 
-### 3.4 Periodic Probe
+### 3.5 Periodic Probe
 
 Even in the dead-zone, a single optimization round is forced every ~30 seconds.
 This serves two purposes:
