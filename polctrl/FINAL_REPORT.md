@@ -109,18 +109,18 @@ Potencjalne ulepszenia (nie-blokujące):
 ```bash
 cd polctrl
 
-# Build biblioteki C
-make -C c
+# Zainstaluj zależności (tworzy .venv)
+uv sync
 
-# Uruchom wszystkie testy (116 testów)
+# Build biblioteki C + uruchom wszystkie testy (116 testów)
 bash scripts/run_all_tests.sh
 
 # Uruchom scenario_runner (generuje wykresy)
-python3 scripts/scenario_runner.py
+uv run python scripts/scenario_runner.py
 # Wykresy: scripts/output/*.png
 
 # Uruchom tylko testy parytetu (krytyczne)
-python3 -m pytest tests/test_parity_c_vs_python.py -v
+uv run pytest tests/test_parity_c_vs_python.py -v
 
 # Sprawdź brak float/double w rdzeniu
 grep -nE '\b(float|double)\b' c/src/{baseline,spsa,fsm,bandit,polctrl}.c

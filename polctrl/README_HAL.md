@@ -266,8 +266,9 @@ Microchip/Atmel dla serii AVR DB.
 
 ```bash
 cd polctrl
-make -C c
-bash scripts/run_all_tests.sh
+uv sync                  # zainstaluj zależności Python (.venv)
+make -C c                # zbuduj bibliotekę C
+bash scripts/run_all_tests.sh   # build + 116 testów + grep checks
 ```
 
 Wszystkie 116 testów powinno przejść (w tym testy parytetu C↔Python).

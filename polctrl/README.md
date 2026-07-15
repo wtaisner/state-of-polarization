@@ -23,17 +23,24 @@ piezo (0–60 V, krok 0.1 V). Wykorzystuje:
 c/              — rdzeń algorytmu w ANSI C99 (bez FPU, bez malloc)
 python/         — symulator fizyczny, referencja, bindings ctypes
 tests/          — testy jednostkowe (pytest)
-scripts/        — skrypty uruchamiające, generator LUT
+scripts/        — skrypty uruchamiające, generator LUT, scenario_runner
+pyproject.toml  — konfiguracja projektu i zależności (uv)
 ```
 
 ## Szybki start
 
 ```bash
-# Build biblioteki C
-cd c && make
+# Zainstaluj zależności (tworzy .venv)
+uv sync
 
-# Uruchom wszystkie testy
-../scripts/run_all_tests.sh
+# Build biblioteki C + uruchom wszystkie testy (116 testów)
+bash scripts/run_all_tests.sh
+
+# Alternatywnie: tylko testy Python
+uv run pytest tests/
+
+# Wygeneruj wykresy scenariuszy
+uv run python scripts/scenario_runner.py
 ```
 
 ## Warstwy
@@ -48,7 +55,8 @@ cd c && make
 
 ## Dokumentacja
 
+- `ALGORITHM.md` — pełny opis algorytmu z diagramami Mermaid
+- `README_HAL.md` — dokumentacja kontraktu API dla elektronika
 - `PROGRESS.md` — historia decyzji projektowych
 - `OPEN_ISSUES.md` — otwarte problemy
-- `README_HAL.md` — dokumentacja kontraktu API dla elektronika
 - `FINAL_REPORT.md` — raport końcowy
