@@ -107,8 +107,6 @@ Potencjalne ulepszenia (nie-blokujące):
 ## Jak uruchomić / zweryfikować pracę
 
 ```bash
-cd polctrl
-
 # Zainstaluj zależności (tworzy .venv)
 uv sync
 

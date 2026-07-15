@@ -265,7 +265,6 @@ Microchip/Atmel dla serii AVR DB.
 ## 9. Szybki test na PC
 
 ```bash
-cd polctrl
 uv sync                  # zainstaluj zależności Python (.venv)
 make -C c                # zbuduj bibliotekę C
 bash scripts/run_all_tests.sh   # build + 116 testów + grep checks
