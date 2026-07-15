@@ -1,777 +1,548 @@
-# PolCtrl — Algorithm Description
+# Algorithm Description
 
-> **Language:** English
-> **Audience:** Engineers implementing, reviewing, or integrating the polarization controller.
-> **Scope:** Full algorithm description with diagrams, formulas, and constant tables.
+> This document describes the polarization control algorithm in theoretical terms,
+> independent of any implementation. The algorithm maximizes the beat note optical
+> power in a fiber-optic link by adjusting four piezoelectric fiber squeezers.
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#1-overview)
-2. [Data Flow: ADC → polctrl_step → DAC](#2-data-flow-adc--polctrl_step--dac)
-3. [Fixed-Point Arithmetic (Q8.8)](#3-fixed-point-arithmetic-q88)
-4. [Adaptive Baseline & Sigma](#4-adaptive-baseline--sigma)
-5. [FSM: TRACK / SEARCH / RECOVERY](#5-fsm-track--search--recovery)
-6. [SPSA Optimizer](#6-spsa-optimizer)
-7. [SPSA Sub-State Machine](#7-spsa-sub-state-machine)
-8. [Contextual Bandit (UCB1)](#8-contextual-bandit-ucb1)
-9. [Bandit Integration with SPSA](#9-bandit-integration-with-spsa)
-10. [Boundary Weighting](#10-boundary-weighting)
-11. [Physical Simulator](#11-physical-simulator)
-12. [Constants Reference](#12-constants-reference)
+1. [Problem Statement](#1-problem-statement)
+2. [System Model](#2-system-model)
+3. [Signal Conditioning: Dual-EMA and Adaptive Baseline](#3-signal-conditioning-dual-ema-and-adaptive-baseline)
+4. [State Machine: TRACK / SEARCH / RECOVERY](#4-state-machine-track--search--recovery)
+5. [SPSA Optimization](#5-spsa-optimization)
+6. [Boundary-Aware Perturbation](#6-boundary-aware-perturbation)
+7. [Contextual Bandit for Gain Adaptation](#7-contextual-bandit-for-gain-adaptation)
+8. [Integration: How the Pieces Fit Together](#8-integration-how-the-pieces-fit-together)
+9. [Summary of Design Choices](#9-summary-of-design-choices)
 
 ---
 
-## 1. Overview
+## 1. Problem Statement
 
-PolCtrl is a real-time (1 ms cadence) polarization controller for a 4-section
-piezoelectric fiber squeezer in a fiber-optic frequency-transfer link. The
-algorithm maximizes the "beat note" optical power (the heterodyne beat between
-a local laser and the incoming signal) by adjusting 4 voltages (0–60 V, 0.1 V
-grid).
+We consider an optical fiber link used for frequency transfer. A local laser
+is combined with the incoming signal, and the resulting **beat note** power
+depends on the relative state of polarization (SOP) between the two. Environmental
+perturbations (temperature, vibration, cable movement) cause the SOP to drift
+stochastically over time.
 
-It runs on a fixed-point (Q8.8, `int16_t`) MCU core with **no FPU** and **no
-heap allocation**, targeting an AVR64DB-class device.
+A **polarization controller** — four piezoelectric fiber squeezers acting as
+variable retarders — can compensate this drift. Each squeezer accepts a voltage
+in $[0, V_{\max}]$ and introduces a birefringence proportional to that voltage.
+The four sections are arranged in two orthogonal pairs, giving sufficient
+degrees of freedom to transform any input SOP to any target SOP on the Poincaré
+sphere.
 
-The algorithm fuses four cooperating techniques:
+**Goal:** Maximize the beat note power (equivalently, minimize the angular
+distance between the output SOP and a reference SOP) despite:
 
-| Technique | Role |
-|-----------|------|
-| **Adaptive baseline + sigma** | Tracks the achievable power ceiling and noise floor without hardcoded dBm thresholds |
-| **FSM (TRACK/SEARCH/RECOVERY)** | Dead-zone gating with hysteresis and sudden-fade detection |
-| **SPSA** | Gradient-free stochastic optimizer: estimates a 4-D gradient with only 2 power measurements |
-| **Contextual bandit (UCB1)** | Adaptively selects SPSA gain profiles based on drift/noise context |
+- Unknown, time-varying SOP drift (ranging from quasi-static to fast),
+- Noisy power measurements,
+- A bounded actuator range,
+- The desire to minimize unnecessary actuator movement (which itself introduces
+  phase noise),
+- No knowledge of the absolute power ceiling (which may degrade over time due
+  to connector aging, bend loss, etc.).
 
----
-
-## 2. Data Flow: ADC → polctrl_step → DAC
-
-The HAL calls `polctrl_init` once at startup, then `polctrl_step` every 1 ms.
-The HAL implements **no decision logic** — only timer → ADC → `polctrl_step`
-→ DAC-if-actuate.
-
-```mermaid
-flowchart TD
-    subgraph HAL["Hardware Abstraction Layer (AVR64DB)"]
-        T["Timer 1 ms"] --> ADC["ADC<br/>read beatnote"]
-        ADC --> SCALE["Scale to Q8.8<br/>value = (dBm + 65) × 256"]
-        SCALE --> STEP
-        OUT --> DAC{"out.actuate?"}
-        DAC -- Yes --> DACW["Write 4× DAC<br/>voltages to piezo"]
-        DACW -.-> |"hold voltages"| HOLD["Hold until next actuate"]
-        DAC -- No --> HOLD
-        HOLD --> T
-    end
-
-    subgraph CORE["polctrl_step (algorithm core)"]
-        STEP["polctrl_step(state, beatnote, &out)"]
-
-        STEP --> BL["1. Baseline update<br/>y_fast, y_slow, ceiling, σ"]
-        BL --> ZS["2. Z-score<br/>z = (baseline - y_slow) / σ"]
-        ZS --> FSM["3. FSM update<br/>TRACK / SEARCH / RECOVERY"]
-        FSM --> SPSA{"4. SPSA sub-FSM"}
-        SPSA --> |IDLE + trigger| SEL["Select gain profile<br/>(bandit or SEARCH)"]
-        SEL --> SP1["SET_PLUS: output θ+δc"]
-        SP1 --> MP["MEASURE_PLUS: wait 225ms"]
-        MP --> SP2["SET_MINUS: output θ-δc"]
-        SP2 --> MM["MEASURE_MINUS: wait 225ms"]
-        MM --> APP["APPLY: θ ← θ + a·ĝ"]
-        APP --> BD["Bandit update<br/>(every 50 cycles)"]
-        SPSA --> |IDLE, no trigger| IDLE["Dead-zone<br/>(hold, no actuation)"]
-        APP --> OUT["out.actuate=1, out.voltages=θ"]
-        IDLE --> OUT2["out.actuate=0"]
-    end
-
-    OUT["PolCtrlOutput"]
-    OUT2["PolCtrlOutput"]
-```
-
-### Input scaling
-
-```
-beatnote_reading = (fp_t)((dBm + 65.0) × 256)
-```
-
-| dBm | Q8.8 value |
-|-----|------------|
-| -65 | 0 |
-| -50 | 3840 |
-| -38 (default ceiling) | 6912 |
-| -35 | 7680 |
-
-### Output scaling
-
-```
-voltage_volts = voltages[i] / 256.0
-```
-
-Voltages are in Q8.8 volts (0–15360), snapped to 0.1 V grid (step = 26).
+The only feedback signal is a scalar: the (noisy) beat note power, sampled at
+regular intervals.
 
 ---
 
-## 3. Fixed-Point Arithmetic (Q8.8)
+## 2. System Model
 
-All arithmetic in the algorithm core uses Q8.8 fixed-point on `int16_t`.
+### 2.1 Poincaré Sphere Representation
 
-| Property | Value |
-|----------|-------|
-| Type | `int16_t` (`fp_t`) |
-| Format | Q8.8 (8-bit signed integer, 8-bit fractional) |
-| Range | −128.0 to +127.996 |
-| Resolution | 1/256 ≈ 0.0039 |
-| `FP_ONE` | 256 |
-| `FP_MAX` | 32767 |
-| `FP_MIN` | −32768 |
+The SOP is represented as a point on the unit sphere $S^2$ via the normalized
+Stokes vector $\mathbf{s} = (s_1, s_2, s_3)$ with $|\mathbf{s}| = 1$.
 
-### Operations
+The beat note power depends on the angular distance $\alpha$ between the
+output SOP $\mathbf{s}_{\text{out}}$ and a reference SOP $\mathbf{s}_{\text{ref}}$:
 
-| Operation | Formula | Rounding |
-|-----------|---------|----------|
-| `fp_mul(a, b)` | `(int32_t)a × b >> 8` | Arithmetic right-shift (toward −∞) |
-| `fp_div(a, b)` | `(a << 8) / b` | C integer division (toward 0) |
-| `fp_div(a, 0)` | — | Saturating: `FP_MAX` if a>0, `FP_MIN` if a<0, 0 if a=0 |
-| `fp_clamp(x, lo, hi)` | `max(lo, min(x, hi))` | — |
-| `fp_abs(x)` | `|x|` (guards `FP_MIN` → `FP_MAX`) | — |
+$$I = \cos^2\!\left(\frac{\alpha}{2}\right), \qquad \alpha = \arccos\!\left(\frac{\mathbf{s}_{\text{out}} \cdot \mathbf{s}_{\text{ref}}}{|\mathbf{s}_{\text{out}}|\,|\mathbf{s}_{\text{ref}}|}\right)$$
 
-All multiplication and division use `int32_t` intermediates to prevent
-overflow, then clamp back to `int16_t`.
+This is the Malus-type law: $I = 1$ when the SOPs are aligned ($\alpha = 0$),
+$I = 0.5$ when orthogonal in the Stokes sense ($\alpha = \pi/2$, 3 dB loss),
+and $I = 0$ when antiparallel ($\alpha = \pi$).
 
-### RNG (xorshift32)
+The power in dBm is:
 
-```
-x ^= x << 13
-x ^= x >> 17
-x ^= x << 5
-```
+$$P = P_{\text{ceiling}} + 10 \log_{10}(I + \varepsilon)$$
 
-Period: 2³² − 1. Seed 0 is remapped to 1. `rng_sign()` returns +1 if the low
-bit of the next draw is 1, else −1. Identical implementation in C and Python
-(bit-exact parity verified by tests).
+where $P_{\text{ceiling}}$ is the best achievable power (when $I = 1$) and
+$\varepsilon$ is a small constant to avoid $\log(0)$.
+
+### 2.2 Actuator Model
+
+The four sections act as sequential retarders. Sections $\{1, 2\}$ rotate the
+SOP around axis $\mathbf{e}_1 = (1, 0, 0)$; sections $\{3, 4\}$ around the
+orthogonal axis $\mathbf{e}_2 = (0, 1, 0)$. The rotation angle of section $i$
+is $\phi_i = (V_i / V_{\max}) \cdot 2\pi$.
+
+The output SOP is:
+
+$$\mathbf{s}_{\text{out}} = R_4 \, R_3 \, R_2 \, R_1 \, \mathbf{s}_{\text{in}}$$
+
+where $R_i$ is the rotation matrix (Rodrigues' formula) for section $i$. The
+input SOP $\mathbf{s}_{\text{in}}$ is subject to environmental drift.
+
+### 2.3 Drift Model
+
+The input SOP drifts according to an Ornstein-Uhlenbeck (OU) process on the
+sphere:
+
+$$dX = -\frac{X}{\tau} \, dt + \sigma \, dW$$
+
+applied to the azimuthal and elevational angles independently, where $\tau$ is
+the time constant (larger $\tau$ = slower drift), $\sigma$ is the diffusion
+amplitude, and $W$ is a Wiener process. This produces correlated, mean-reverting
+drift — more realistic than white noise.
+
+### 2.4 Measurement Noise
+
+Two noise regimes are modeled:
+
+1. **White Gaussian:** $P_{\text{obs}} = P + \mathcal{N}(0, \sigma_n)$
+2. **Interferometric:** A composite of multiple sinusoidal components (parasitic
+   interferometers beating at different frequencies) plus a white component.
+   This is structurally non-Gaussian and non-stationary.
 
 ---
 
-## 4. Adaptive Baseline & Sigma
+## 3. Signal Conditioning: Dual-EMA and Adaptive Baseline
 
-**Module:** `baseline.c`
-**Purpose:** Track the achievable power ceiling and measurement noise without
-hardcoded dBm thresholds.
+### 3.1 Dual Exponential Moving Average
 
-### Data structure
+Two EMAs of the raw power reading $y_t$ are maintained:
 
-```c
-typedef struct {
-    fp_t baseline;       // estimated achievable ceiling
-    fp_t noise_sigma;    // estimated noise std dev
-    fp_t y_fast;         // fast EMA (τ = 8 ms)
-    fp_t y_slow;         // slow EMA (τ = 75 ms)
-    uint8_t initialized; // 0 during cold-start, 1 after warmup
-    uint16_t warmup_counter;
-} BaselineState;
-```
+$$y_{\text{fast}}^{(t)} = y_{\text{fast}}^{(t-1)} + \alpha_f \left( y_t - y_{\text{fast}}^{(t-1)} \right), \qquad \alpha_f = \frac{\Delta t}{\tau_f}$$
 
-### Two EMAs
+$$y_{\text{slow}}^{(t)} = y_{\text{slow}}^{(t-1)} + \alpha_s \left( y_t - y_{\text{slow}}^{(t-1)} \right), \qquad \alpha_s = \frac{\Delta t}{\tau_s}$$
 
-| EMA | Time constant | α (Q8.8) | Purpose |
-|-----|---------------|----------|---------|
-| `y_fast` | 8 ms | 32 (0.125) | Quick signal tracking; sudden-fade detection |
-| `y_slow` | 75 ms | 3 (≈0.012) | Smoothed power; SPSA measurement; baseline reference |
+with $\tau_f \ll \tau_s$ (e.g., $\tau_f = 8$ ms, $\tau_s = 75$ ms).
 
-Update formula:
-```
-y_new = y_old + α × (y_raw − y_old)
-```
+| Signal | Time constant | Role |
+|--------|--------------|------|
+| $y_{\text{fast}}$ | $\tau_f$ (short) | Tracks the signal quickly; used for sudden-fade detection |
+| $y_{\text{slow}}$ | $\tau_s$ (long) | Smoothed signal; used as the SPSA measurement and baseline reference |
 
-### Asymmetric ceiling tracker
+### 3.2 Adaptive Ceiling (Asymmetric Tracker)
 
-```
-if y_slow > baseline:
-    baseline = y_slow          ← fast rise (1 step)
-else:
-    baseline -= 1              ← slow fall (1 LSB/ms ≈ 30 s per dBm)
-```
+The estimated achievable power ceiling $B_t$ is updated by an **asymmetric
+integrator**:
 
-This one-sided integrator lets the baseline:
-- **Believe improvements immediately** — if SPSA finds a better alignment and
-  power improves, the ceiling follows instantly.
-- **Be skeptical of degradations** — a slow leak (1 LSB/ms) lets the baseline
-  track gradual channel degradation (connector aging, drift) without false
-  SEARCH triggers. A transient dip (fade) is faster than 30 s, so the baseline
-  holds high and the z-score spikes, correctly triggering SEARCH.
+$$B_{t+1} = \begin{cases} y_{\text{slow}}^{(t)} & \text{if } y_{\text{slow}}^{(t)} > B_t \quad \text{(fast rise)} \\ B_t - \delta & \text{otherwise} \quad \text{(slow linear decay)} \end{cases}$$
 
-```mermaid
-graph LR
-    subgraph "Baseline update logic"
-        A["y_raw"] --> B["y_fast EMA<br/>α = 0.125"]
-        A --> C["y_slow EMA<br/>α = 0.012"]
-        C --> D{"y_slow > baseline?"}
-        D -- Yes --> E["baseline = y_slow<br/>(fast rise)"]
-        D -- No --> F["baseline -= 1<br/>(slow fall)"]
-        E --> G["baseline"]
-        F --> G
-        A --> H{"in dead-zone?"}
-        H -- Yes --> I["σ = EMA(|y_raw − y_slow|)<br/>α = 0.012"]
-        H -- No --> J["σ unchanged<br/>(no contamination)"]
-    end
-```
+where $\delta$ is a small constant step (one least-significant-bit per sample).
 
-### Z-score
+**Rationale:** This design encodes an asymmetric belief about the signal:
+improvements are trusted immediately (the ceiling snaps up), while degradations
+are treated with skepticism (the ceiling leaks downward slowly, over ~30 s per
+dBm). This means:
 
-```
-z = (baseline − y_slow) / max(noise_sigma, 1)
-```
+- A **genuine ceiling drop** (e.g., connector degradation at ~1 dBm/s) is
+  tracked, keeping the gap $B - y_{\text{slow}}$ small and avoiding false
+  alarms.
+- A **transient dip** (sudden fade, faster than 30 s) is faster than the leak,
+  so the ceiling holds high, the gap widens, and the z-score spikes — correctly
+  triggering aggressive search.
 
-- Positive z = degradation below the estimated ceiling.
-- During cold-start (first 200 samples): returns `FP_MAX` (forces SEARCH).
-- Scale-invariant: works whether ceiling is −38 dBm or −50 dBm, whether noise
-  is 0.1 or 2 dBm. **No magic dBm numbers anywhere in the decision logic.**
+### 3.3 Noise Sigma Estimation
 
-### Cold-start
+The noise standard deviation $\hat{\sigma}_n$ is estimated as an EMA of the
+absolute residual:
 
-For the first 200 ms, `initialized = 0`, so `baseline_zscore` returns `FP_MAX`,
-forcing the FSM into SEARCH. At step 200, `baseline = y_slow` and normal
+$$\hat{\sigma}_n^{(t)} = \hat{\sigma}_n^{(t-1)} + \alpha_s \left( |y_t - y_{\text{slow}}^{(t)}| - \hat{\sigma}_n^{(t-1)} \right)$$
+
+This update is performed **only when the controller is in dead-zone** (i.e.,
+the signal is considered stable and no active probing is occurring). This
+prevents contamination of the noise estimate by real signal changes during
+optimization or recovery.
+
+### 3.4 Z-Score
+
+The normalized degradation signal is:
+
+$$z_t = \frac{B_t - y_{\text{slow}}^{(t)}}{\max(\hat{\sigma}_n, \, \varepsilon)}$$
+
+This is **scale-invariant**: it expresses the gap to the ceiling in units of
+the estimated noise standard deviation. The thresholds $k_1$ and $k_2$ (see
+§4) are defined in these units, so they work regardless of the absolute power
+level or noise amplitude. No hardcoded dBm values appear anywhere in the
+decision logic.
+
+### 3.5 Cold Start
+
+During an initial warmup period (e.g., 200 samples), the ceiling is
+uninitialized and $z_t$ is set to $+\infty$, forcing the controller into
+SEARCH mode. After warmup, $B$ is initialized to $y_{\text{slow}}$ and normal
 operation begins.
 
-### Sigma estimator
-
-```
-σ = EMA(|y_raw − y_slow|)    [only updated in dead-zone]
-```
-
-The dead-zone guard prevents sigma contamination from real signal drops during
-SPSA probing or SEARCH. Uses `|y_raw − y_slow|` (deviation of raw signal from
-the slow mean) rather than `|y_fast − y_slow|`, because it captures the full
-noise amplitude.
-
 ---
 
-## 5. FSM: TRACK / SEARCH / RECOVERY
+## 4. State Machine: TRACK / SEARCH / RECOVERY
 
-**Module:** `fsm.c`
-**Purpose:** Decide when to actuate (dead-zone gate) and when to enter
-aggressive search mode.
-
-### State diagram
+The controller operates in one of three modes, governed by the z-score and
+a sudden-fade detector.
 
 ```mermaid
 stateDiagram-v2
     [*] --> TRACK
 
-    TRACK --> SEARCH: z > 8σ (k2)\nOR sudden fade\n(y_slow − y_fast) > 0.25·y_slow
-    SEARCH --> RECOVERY: z < 2.5σ (k1)
-    RECOVERY --> TRACK: 5× consecutive z < 2.5σ (k1)\n(hysteresis)
-    RECOVERY --> SEARCH: z > 8σ (k2)\n(regression)
+    TRACK --> SEARCH: z > k₂ OR sudden fade
+    SEARCH --> RECOVERY: z < k₁
+    RECOVERY --> TRACK: N consecutive windows with z < k₁
+    RECOVERY --> SEARCH: z > k₂ (regression)
 ```
 
-### Thresholds
+### 4.1 Sudden-Fade Detection
 
-| Threshold | Value | Meaning |
-|-----------|-------|---------|
-| k1 (dead-zone) | 2.5σ (Q8.8: 640) | Below this: no actuation (dead-zone) |
-| k2 (SEARCH) | 8.0σ (Q8.8: 2048) | Above this: enter SEARCH |
-| Hysteresis | 5 windows | Consecutive good windows to exit SEARCH → TRACK |
-| Sudden fade | 0.25 × y_slow | y_fast drops >25% below y_slow → SEARCH |
+Before the z-score is evaluated, a heuristic checks for rapid signal drops:
 
-### Sudden-fade detection
+$$\text{if } \left( y_{\text{slow}} - y_{\text{fast}} \right) > \beta \cdot y_{\text{slow}} \quad \text{then SEARCH}$$
 
-Runs **before** the z-score check, independent of sigma:
-```
-if (y_slow − y_fast) > 0.25 × y_slow:
-    mode = SEARCH
-```
+with $\beta = 0.25$ (the fast EMA has dropped more than 25% below the slow EMA).
 
-The fast EMA reacts ~9× faster than the slow EMA, so a sharp drop opens a large
-`y_slow − y_fast` gap before the z-score (which uses lagging `y_slow`)
-registers.
+Since $y_{\text{fast}}$ reacts approximately $\tau_s / \tau_f \approx 9\times$
+faster than $y_{\text{slow}}$, a sharp drop opens a large gap between the two
+EMAs before the z-score (which uses the lagging $y_{\text{slow}}$) can register.
+This provides a fast detection path independent of the sigma estimate, which
+may be unreliable during transients.
 
-### Dead-zone gate (`fsm_should_actuate`)
+### 4.2 Transitions
 
-| Mode | Actuate when |
-|------|-------------|
-| SEARCH | Always (1) |
-| TRACK | z > k1, OR periodic probe due |
-| RECOVERY | z > k1 |
+| Transition | Condition | Notes |
+|------------|-----------|-------|
+| TRACK → SEARCH | $z > k_2$ or sudden fade | $k_2 = 8\sigma$: severe degradation |
+| SEARCH → RECOVERY | $z < k_1$ | $k_1 = 2.5\sigma$: signal recovered to dead-zone |
+| RECOVERY → TRACK | $N$ consecutive windows with $z < k_1$ | $N = 5$: hysteresis prevents oscillation |
+| RECOVERY → SEARCH | $z > k_2$ | Regression: signal degraded again |
 
-### Periodic probe
+### 4.3 Dead-Zone Gate
 
-Every `PERIODIC_PROBE_INTERVAL` (30,000 samples = 30 s), forces one SPSA round
-even in dead-zone. Disabled in SEARCH (already exploring). This provides
-exploration data to the bandit and re-confirms the optimum.
+The dead-zone gate determines whether the optimizer should actuate:
 
-### Gain profile selection
+$$\text{actuate} = \begin{cases} \text{true} & \text{if mode = SEARCH} \\ \text{true} & \text{if } z > k_1 \quad \text{(TRACK or RECOVERY)} \\ \text{false} & \text{otherwise (dead-zone: signal is stable)} \end{cases}$$
 
-| Mode | Gain profile |
-|------|-------------|
-| SEARCH | Fixed: (a=8V, c=8V), boundary weighting **disabled** |
-| TRACK / RECOVERY | Bandit-selected arm |
+When in the dead-zone, the controller does not move the actuator — it only
+monitors. This reduces unnecessary phase noise from piezo movement.
+
+### 4.4 Periodic Probe
+
+Even in the dead-zone, a single optimization round is forced every $T_{\text{probe}}$
+(e.g., 30 s). This serves two purposes: (1) re-confirm that the current operating
+point is still optimal, and (2) provide exploration data to the bandit. The
+periodic probe is disabled in SEARCH mode (where exploration is already
+continuous).
 
 ---
 
-## 6. SPSA Optimizer
+## 5. SPSA Optimization
 
-**Module:** `spsa.c`
-**Purpose:** Stochastic gradient-free optimization of 4 voltages using only 2
-power measurements per iteration.
+### 5.1 The SPSA Principle
 
-### Gradient estimate
+The **Simultaneous Perturbation Stochastic Approximation** (Spall, 1992)
+estimates the gradient of an objective function $f(\boldsymbol{\theta})$ using
+only **two** function evaluations per iteration, regardless of the dimensionality
+of $\boldsymbol{\theta}$.
 
-Standard SPSA formula — perturb all 4 axes simultaneously with random ±1
-directions, measure power at both perturbation points:
+For a parameter vector $\boldsymbol{\theta} \in \mathbb{R}^d$ ($d = 4$ here),
+the SPSA gradient estimate at iteration $k$ is:
 
-```
-ĝ_i = (y_plus − y_minus) / (2 · c_{k,i} · δ_i)
-```
+$$\hat{g}_k^{(i)} = \frac{f(\boldsymbol{\theta}_k + c_k \boldsymbol{\Delta}_k) - f(\boldsymbol{\theta}_k - c_k \boldsymbol{\Delta}_k)}{2 \, c_k \, \Delta_k^{(i)}}$$
 
 where:
-- `δ_i ∈ {−1, +1}` — random perturbation direction (or forced inward near edges)
-- `c_{k,i} = c_gain · w(θ_i)` — per-coordinate perturbation size
-- `w(θ_i)` — boundary weight (see [§10](#10-boundary-weighting))
+- $\boldsymbol{\Delta}_k = (\Delta_k^{(1)}, \ldots, \Delta_k^{(d)})$ is a random
+  perturbation vector with each component $\Delta_k^{(i)} \in \{-1, +1\}$,
+  drawn independently,
+- $c_k > 0$ is the perturbation magnitude.
 
-Because `δ_i = ±1`, this simplifies to:
-```
-ĝ_i = (y_plus − y_minus) · δ_i / (2 · c_{k,i})
-```
+The parameter update is:
 
-The sign of the gradient follows the perturbation direction; the magnitude is
-`y_diff / (2 · c_k)`.
+$$\boldsymbol{\theta}_{k+1} = \boldsymbol{\theta}_k + a_k \, \hat{\mathbf{g}}_k$$
 
-### Update rule
+where $a_k > 0$ is the step size (gain).
 
-```
-θ_i ← snap₀.₁V( clip[0, 60V]( θ_i + a_gain · ĝ_i ) )
-```
+**Key advantage:** Only 2 measurements are needed per gradient estimate,
+whether $d = 4$ or $d = 100$. This is critical when each measurement is
+expensive (here, each requires settling time for the EMA to converge).
 
-- Gradient clamped to ±4.0 (prevents wild updates from small `c_k`)
-- Voltage clamped to [0, 60V]
-- Snapped to 0.1 V grid (`V_STEP_Q88 = 26`)
+### 5.2 Measurement Protocol
 
-### Two-phase API
+Each SPSA iteration consists of:
 
-The SPSA cycle is split into two functions (intentional — the HAL must
-physically set voltages between them):
+1. Generate random perturbation $\boldsymbol{\Delta}_k$.
+2. Set actuator to $\boldsymbol{\theta}_k + c_k \boldsymbol{\Delta}_k$ (probe point +).
+3. Wait for the slow EMA to settle (time $\approx 3\tau_s$ for 95% convergence).
+4. Record $y_+ = y_{\text{slow}}$ (the smoothed power at probe +).
+5. Set actuator to $\boldsymbol{\theta}_k - c_k \boldsymbol{\Delta}_k$ (probe point −).
+6. Wait for settling.
+7. Record $y_- = y_{\text{slow}}$.
+8. Compute $\hat{\mathbf{g}}_k$ and update $\boldsymbol{\theta}_{k+1}$.
 
-| Function | What it does | When called |
-|----------|-------------|-------------|
-| `spsa_compute_probe` | Generates `theta_plus`, `theta_minus`; stores `delta`, `c_k` | Before setting probe voltages on actuator |
-| `spsa_apply_result` | Receives `y_plus`, `y_minus`; computes gradient; updates `theta` | After measuring power at both probe points |
+Using $y_{\text{slow}}$ rather than the raw reading as the measurement rejects
+measurement noise (the EMA acts as a low-pass filter).
 
----
+### 5.3 Per-Coordinate Perturbation
 
-## 7. SPSA Sub-State Machine
+The perturbation magnitude $c_k$ is applied **per coordinate**, but each
+coordinate $i$ may have a different effective magnitude $c_k^{(i)} = c_k \cdot w(\theta_k^{(i)})$,
+where $w$ is the boundary weight (see §6). The gradient formula becomes:
 
-**Module:** `polctrl.c` (inside `polctrl_step`)
-**Purpose:** Orchestrate the multi-step SPSA cycle across multiple 1 ms calls.
+$$\hat{g}_k^{(i)} = \frac{y_+ - y_-}{2 \, c_k^{(i)} \, \Delta_k^{(i)}}$$
 
-A full SPSA cycle takes **453 ms** (2 × 225 ms settle + 3 transition steps).
+### 5.4 Gain Profiles
 
-```mermaid
-stateDiagram-v2
-    [*] --> IDLE
+The gains $(a, c)$ are not fixed — they are selected by the contextual bandit
+(see §7) from a discrete set of profiles:
 
-    IDLE --> SET_PLUS: should_actuate (z > k1 or SEARCH)\nOR periodic probe (every 30s)
-    note right of IDLE: Select gain profile\n(SEARCH fixed or bandit arm)
+| Profile | $a$ (step size) | $c$ (perturbation) | Character |
+|---------|-----------------|---------------------|-----------|
+| 0 | small | small | Conservative (fine-tune near optimum) |
+| 1 | small | large | Cautious exploration |
+| 2 | large | small | Aggressive exploitation |
+| 3 | large | large | Aggressive exploration |
+| SEARCH | very large | very large | Fixed override (recovery from large perturbation) |
 
-    SET_PLUS --> MEASURE_PLUS: output θ+δc, actuate=1
-    note right of SET_PLUS: disable_boundary_weight = (mode == SEARCH)
-
-    MEASURE_PLUS --> SET_MINUS: settle_counter == 0\n(y_plus = y_slow)
-    note right of MEASURE_PLUS: wait 225 ms (3τ_slow)\nfor EMA to settle to ~95%
-
-    SET_MINUS --> MEASURE_MINUS: output θ−δc, actuate=1
-    note right of SET_MINUS: reconstruct θ− from stored δ, c_k
-
-    MEASURE_MINUS --> APPLY: settle_counter == 0\n(y_minus = y_slow)
-
-    APPLY --> IDLE: θ ← θ + a·ĝ, actuate=1\nupdate drift, reward, bandit?
-```
-
-### Timing breakdown
-
-| Phase | Duration | Actuate? | Output |
-|-------|----------|----------|--------|
-| IDLE → SET_PLUS | 1 ms | Yes (1) | θ + δ·c_k |
-| MEASURE_PLUS | 225 ms | No (hold θ+) | — |
-| SET_MINUS | 1 ms | Yes (1) | θ − δ·c_k |
-| MEASURE_MINUS | 225 ms | No (hold θ−) | — |
-| APPLY | 1 ms | Yes (1) | new θ |
-| **Total** | **453 ms** | **3 actuations** | |
-
-### Why 225 ms settle?
-
-`SPSA_SETTLE_SAMPLES = 3 × TAU_SLOW_MS = 3 × 75 = 225`. This gives the slow EMA
-(τ = 75 ms) time to converge to ~95% of the new steady-state power after a
-voltage change. The measurement uses `y_slow` (not raw), which rejects noise.
+In SEARCH mode, the bandit is bypassed and a fixed aggressive profile is used.
 
 ---
 
-## 8. Contextual Bandit (UCB1)
+## 6. Boundary-Aware Perturbation
 
-**Module:** `bandit.c`
-**Purpose:** Adaptively select SPSA gain profiles based on drift/noise context.
+### 6.1 Problem
 
-### Data structure
+The actuator voltages are bounded: $\theta^{(i)} \in [0, V_{\max}]$. Near the
+rails, two issues arise:
+- Random perturbations may push the voltage beyond the range (wasting a
+  measurement).
+- The optimizer may get "stuck" against a rail, unable to explore the
+  gradient in one direction.
 
-```c
-typedef struct {
-    fp_t q_value[6][4];      // Q-table: 6 context buckets × 4 arms
-    uint32_t count[6][4];    // visit counts
-    uint32_t total_count;    // total pulls
-} BanditState;
-```
+### 6.2 Perturbation Damping
 
-### Arms (gain profiles)
+A weight function reduces the perturbation magnitude near the rails:
 
-| Arm | a_gain | c_gain | Character |
-|-----|--------|--------|-----------|
-| 0 | 1 V | 1 V | Conservative |
-| 1 | 1 V | 4 V | Cautious explore |
-| 2 | 4 V | 1 V | Aggressive exploit |
-| 3 | 4 V | 4 V | Aggressive explore |
+$$w(\theta) = \begin{cases} 1 & \text{if } m \leq \theta \leq V_{\max} - m \\ w_{\min} + (1 - w_{\min}) \cdot \frac{d(\theta)}{m} & \text{otherwise} \end{cases}$$
 
-### Context discretization
-
-```mermaid
-flowchart LR
-    subgraph "Context inputs"
-        D["drift_estimate<br/>EMA of mean|grad|"]
-        N["noise_sigma<br/>from baseline"]
-    end
-
-    D --> DR{"drift level"}
-    DR -- "< 0.02" --> DL["low (0)"]
-    DR -- "0.02–0.195" --> DM["mid (1)"]
-    DR -- "> 0.195" --> DH["high (2)"]
-
-    N --> NR{"noise level"}
-    NR -- "< 0.078" --> NL["low (0)"]
-    NR -- "≥ 0.078" --> NH["high (1)"]
-
-    DL --> B["bucket = drift×2 + noise"]
-    DM --> B
-    DH --> B
-    NL --> B
-    NH --> B
-
-    B --> B0["0: low drift, low noise"]
-    B --> B1["1: low drift, high noise"]
-    B --> B2["2: mid drift, low noise"]
-    B --> B3["3: mid drift, high noise"]
-    B --> B4["4: high drift, low noise"]
-    B --> B5["5: high drift, high noise"]
-```
-
-### UCB1 selection
-
-```
-arm* = argmax_a  Q[bucket][a] + C · sqrt( ln(N+1) / (n_a + 1) )
-```
-
-with `C = 2.0` (Q8.8: 512).
-
-Implementation details (no FPU):
-- `sqrt(ln(N+1))` — precomputed LUT (128 entries, Q8.8), generated offline by
-  `scripts/generate_lut.py`
-- `sqrt(n+1)` — integer square root (`isqrt`), bit-by-bit Newton-style
-- **Forced first-play:** if `count[bucket][a] == 0`, return `a` immediately
-
-### Q-value update (EMA)
-
-```
-count[bucket][arm]++
-total_count++
-effective_count = min(count[bucket][arm], 255)
-alpha = 256 / effective_count          (integer division)
-if alpha == 0: alpha = 1               (count > 254, floor at smallest step)
-Q[bucket][arm] += alpha × (reward − Q[bucket][arm])
-```
-
-The cap at 255 prevents precision loss in Q8.8 for large counts. Once count
-exceeds 254, `alpha` floors at 1/255 ≈ 0.004, allowing slow continued
-adaptation rather than freezing.
-
-### LUT generation
-
-The `SQRT_LN_LUT` is the **only** place with "floating-point math" — computed
-once offline in Python, embedded as a `static const` array in C. No `sqrt`/`log`
-calls in runtime C code.
-
----
-
-## 9. Bandit Integration with SPSA
-
-```mermaid
-sequenceDiagram
-    participant IDLE
-    participant SEL as Arm Selection
-    participant CYC as SPSA Cycle<br/>(453 ms)
-    participant ACC as Reward Accumulator
-    participant BAN as Bandit Update
-
-    IDLE->>SEL: Trigger (z > k1 or periodic)
-    Note over SEL: context = discretize(drift, σ)<br/>arm = UCB1(context)<br/>gain = ARM_PROFILES[arm]
-
-    SEL->>CYC: Start SPSA with selected gain
-    Note over CYC: SET_PLUS → MEASURE_PLUS<br/>SET_MINUS → MEASURE_MINUS<br/>APPLY: θ ← θ + a·ĝ
-
-    CYC->>ACC: Accumulate reward components
-    Note over ACC: reward_power_sum += y_slow<br/>reward_boundary_sum += boundary_frac<br/>reward_movement_sum += Σ|Δθ|
-
-    ACC->>ACC: bandit_iter_counter++
-
-    alt counter ≥ 50 AND mode ≠ SEARCH
-        ACC->>BAN: Compute mean reward
-        Note over BAN: reward = mean(y_slow)<br/>− 1.0 · boundary_frac<br/>− 1.0 · mean_movement
-        BAN->>BAN: Q[context][arm] += α·(reward − Q)
-        Note over BAN: Reset accumulators
-    end
-
-    BAN->>IDLE: Cycle complete
-```
-
-### Reward formula
-
-```
-reward = mean(y_slow) − λ · boundary_fraction − μ · total_movement
-```
-
-with `λ = μ = 1.0`.
-
-| Component | What it measures | Sign in reward |
-|-----------|-----------------|----------------|
-| `mean(y_slow)` | Sustained power level | + (higher is better) |
-| `boundary_fraction` | Fraction of sections in edge zone | − (penalize edge operation) |
-| `total_movement` | Σ|Δθ| across sections | − (penalize excessive actuator churn) |
-
-### Key design decisions
-
-1. **Arm selected once per SPSA cycle** (at IDLE → SET_PLUS), not per step. The
-   `(context, arm)` pair is latched for the entire 453 ms cycle.
-
-2. **Reward attributed to the latched pair.** Even if context drifts within the
-   50-cycle window, the reward is credited to the `(context, arm)` that was
-   active — standard contextual-bandit credit assignment.
-
-3. **SEARCH cycles do not update the bandit** (`mode != SEARCH` guard). In
-   SEARCH, the arm wasn't used (SEARCH gain overrides), so crediting it would
-   contaminate the Q-table.
-
-4. **Update window = 50 SPSA cycles ≈ 22.5 s wall time.** The reward is the
-   *average* behavior over this window — a meaningful signal for the bandit.
-
----
-
-## 10. Boundary Weighting
-
-**Module:** `spsa.c`
-**Purpose:** Keep the actuator away from the 0V/60V rails.
-
-Three cooperating mechanisms:
-
-### 10.1 Perturbation size damping
+where:
+- $m$ is the margin (e.g., 5V) within which damping is active,
+- $d(\theta) = \min(\theta, \, V_{\max} - \theta)$ is the distance to the nearest rail,
+- $w_{\min}$ is the floor weight (e.g., 0.2).
 
 ```mermaid
 graph LR
-    subgraph "boundary_weight(θ)"
-        A["θ = 0V"] -->|"w = 0.2"| B["θ = 2V"]
-        B --> C["θ = 5V"]
-        C -->|"w = 1.0"| D["θ = 55V"]
-        D --> E["θ = 58V"]
-        E -->|"w = 0.2"| F["θ = 60V"]
-    end
+    A["θ = 0<br/>w = 0.2"] --> B["θ = m<br/>w = 1.0"]
+    B --> C["θ = V_max/2<br/>w = 1.0"]
+    C --> D["θ = V_max − m<br/>w = 1.0"]
+    D --> E["θ = V_max<br/>w = 0.2"]
 ```
 
-```
-w(θ) = 1.0                              if 5V ≤ θ ≤ 55V  (center)
-w(θ) = 0.2 + 0.8 × (d / 5V)            otherwise          (edge ramp)
-```
+The effective perturbation is $c^{(i)} = c \cdot w(\theta^{(i)})$. At the rail,
+the perturbation shrinks to 20% of nominal, making the optimizer "tiptoe" near
+edges.
 
-where `d` = distance to nearest rail. At θ=0V or θ=60V: w = 0.2 (perturbation
-is 20% of nominal). Linear ramp to 1.0 at 5V / 55V.
+### 6.3 Forced Inward Direction
 
-**Effect:** `c_k = c_gain × w(θ)`, so near rails the probe step shrinks to 20%,
-making the optimizer "tiptoe" near edges.
+When the actuator is within a very small margin $m_{\text{inward}}$ (e.g., 2V)
+of a rail, the perturbation direction is forced inward rather than random:
 
-### 10.2 Forced inward direction
+$$\Delta_k^{(i)} = \begin{cases} +1 & \text{if } \theta^{(i)} < m_{\text{inward}} \\ -1 & \text{if } \theta^{(i)} > V_{\max} - m_{\text{inward}} \\ \text{random } \pm 1 & \text{otherwise} \end{cases}$$
 
-```
-θ < 2V  →  δ = +1   (always probe upward, away from 0)
-θ > 58V →  δ = −1   (always probe downward, away from 60)
-else    →  δ = random ±1
-```
+This guarantees that the next probe moves away from the rail, preventing
+the optimizer from being stuck.
 
-Guarantees that when within 2V of a rail, the next probe moves inward.
+### 6.4 Disabled in SEARCH
 
-### 10.3 Disabled in SEARCH
-
-When `disable_boundary_weight = 1` (SEARCH mode), `w` is forced to 1.0
-everywhere. Rationale: in SEARCH we're far from the optimum and need
-aggressive, full-magnitude exploration everywhere — edge-avoidance would slow
-recovery.
-
-### 10.4 Boundary in reward
-
-`compute_boundary_fraction` counts sections where `w(θ) < 1.0`. This fraction
-(0 to 1) feeds the reward penalty `−λ · boundary_fraction`, so the bandit
-learns to prefer arms that keep the operating point away from rails.
+During SEARCH, the boundary weighting is disabled ($w \equiv 1$), and the full
+perturbation magnitude is used everywhere. This is a deliberate trade-off: in
+SEARCH, the system is far from the optimum and needs aggressive exploration
+across the entire range. Edge-avoidance would slow recovery.
 
 ---
 
-## 11. Physical Simulator
+## 7. Contextual Bandit for Gain Adaptation
 
-**Module:** `python/simulator.py`
-**Purpose:** Generate realistic beatnote trajectories for offline testing.
+### 7.1 Motivation
 
-### SOP representation
+The optimal SPSA gains $(a, c)$ depend on the operating conditions:
+- **Slow drift, low noise:** small gains suffice (fine-tune and hold),
+- **Fast drift, high noise:** large gains needed (track aggressively despite
+  noise).
 
-Point on the Poincaré sphere: normalized Stokes vector `(s1, s2, s3)` with
-`s1² + s2² + s3² = 1`.
+Since the drift regime changes over time, a fixed gain profile is suboptimal.
+We use a **contextual bandit** to adaptively select the gain profile based on
+the current drift/noise context.
 
-### Actuator model
+### 7.2 Contextual Bandit Framework
 
-4 sections as retarders (rotations on the sphere):
+A contextual bandit is a sequential decision problem where, at each round $t$:
+1. The agent observes a **context** $\mathbf{x}_t$,
+2. Selects an **arm** (action) $a_t$ from a set of $K$ arms,
+3. Receives a **reward** $r_t$,
+4. Updates its policy.
 
-| Sections | Rotation axis | Angle |
-|----------|--------------|-------|
-| {0, 1} | A = (1, 0, 0) [s1 axis] | `φ = (V / V_max) × 2π` |
-| {2, 3} | B = (0, 1, 0) [s2 axis] | `φ = (V / V_max) × 2π` |
+The goal is to minimize cumulative regret: the gap between the reward of the
+best arm for each context and the reward actually obtained.
 
-Applied sequentially: `SOP_out = R3 · R2 · R1 · R0 · SOP_in` (Rodrigues' formula).
+### 7.3 Context Discretization
 
-### Power computation
+The context is two-dimensional: $(\hat{d}_t, \hat{\sigma}_n)$, where:
+- $\hat{d}_t$ is the estimated drift rate (EMA of the mean gradient magnitude
+  $\frac{1}{d}\sum_i |\hat{g}^{(i)}_k|$, smoothed over iterations),
+- $\hat{\sigma}_n$ is the estimated noise sigma (from §3.3).
 
-```
-ang       = angle_between(SOP_out, SOP_ref)
-intensity = cos²(ang / 2)                    [0, 1]
-power_dbm = channel_ceiling + 10·log10(intensity + ε)
-power_dbm = clip(power_dbm, −65, −35)
-```
+This is discretized into $3 \times 2 = 6$ buckets:
 
-Perfect match (ang=0) → power = ceiling (default −38 dBm). Orthogonal (180°)
-→ power → −65 dBm.
+| | Low noise | High noise |
+|---|-----------|------------|
+| Low drift | Bucket 0 | Bucket 1 |
+| Mid drift | Bucket 2 | Bucket 3 |
+| High drift | Bucket 4 | Bucket 5 |
 
-### Drift model (Ornstein-Uhlenbeck)
+### 7.4 UCB1 Policy
 
-```
-dX = −X/τ · dt + σ · √dt · dW
-```
+The arm is selected using the **UCB1** algorithm (Auer, Cesa-Bianchi, Fischer
+2002), which balances exploration and exploitation:
 
-Applied independently to azimuth and elevation of the input SOP. Configurable
-`drift_tau_ms` (larger = slower) and `drift_amplitude`.
+$$a_t = \arg\max_a \left[ Q(b, a) + C \sqrt{\frac{\ln(N+1)}{n(b,a)+1}} \right]$$
 
-### Noise models
+where:
+- $Q(b, a)$ is the estimated mean reward for arm $a$ in bucket $b$,
+- $n(b, a)$ is the number of times arm $a$ has been selected in bucket $b$,
+- $N$ is the total number of pulls across all arms in bucket $b$,
+- $C$ is the exploration constant (e.g., $C = 2.0$).
 
-| Mode | Description |
-|------|-------------|
-| `white` | Gaussian noise: `power += N(0, σ)` |
-| `interferometric` | Sum of 5 sinusoids (0.5–7.9 Hz) + 30% white noise |
+The first term exploits the arm with the highest observed reward; the second
+term (the **exploration bonus**) favors arms that have been tried less often.
+UCB1 has a logarithmic regret guarantee: $R_T = O(\log T)$.
 
-### Scenarios
+### 7.5 Q-Value Update
 
-| Scenario | Tests |
-|----------|-------|
-| `scenario_stable` | Dead-zone (no drift, low noise) |
-| `scenario_slow_drift` | Slow OU drift |
-| `scenario_fast_drift` | Fast drift + interferometric noise |
-| `scenario_regime_switch` | Slow → fast drift at 5 s (bandit adaptivity) |
-| `scenario_cold_start` | Random bad SOP (SEARCH mode) |
-| `scenario_sudden_fade` | SOP jump at step 5000 (sudden-fade detection) |
-| `scenario_channel_degradation` | Ceiling drops at −1 dBm/s (baseline tracking) |
+After receiving reward $r_t$, the Q-value is updated via an EMA:
 
----
+$$Q(b, a) \leftarrow Q(b, a) + \alpha \cdot (r_t - Q(b, a))$$
 
-## 12. Constants Reference
+with $\alpha = 1 / \min(n(b,a), \, n_{\max})$. The cap $n_{\max}$ (e.g., 255)
+prevents the learning rate from becoming negligibly small — the Q-value
+continues to adapt slowly even after many pulls, rather than freezing.
 
-### Physical / voltage
+### 7.6 Reward Design
 
-| Constant | Value | Unit | Description |
-|----------|-------|------|-------------|
-| `NUM_SECTIONS` | 4 | — | Piezo channels |
-| `V_MIN_VOLT` / `V_MAX_VOLT` | 0 / 60 | V | Voltage range |
-| `V_STEP_VOLT` | 0.1 | V | Grid step |
-| `V_STEP_Q88` | 26 | Q8.8 | 0.1V in Q8.8 (25.6 rounded) |
-| `V_MIN_Q88` / `V_MAX_Q88` | 0 / 15360 | Q8.8 | 0V / 60V |
-| `BEATNOTE_MIN_DBM` / `_MAX` | −65 / −35 | dBm | Detector range |
-| `BEATNOTE_OFFSET` | 65 | dBm | Offset for internal scaling |
+The reward is computed as the average over a window of $W$ SPSA iterations
+(e.g., $W = 50$):
 
-### Sampling / EMA
+$$r = \underbrace{\overline{y_{\text{slow}}}}_{\text{sustained power}} - \lambda \cdot \underbrace{\overline{f_{\text{boundary}}}}_{\text{edge proximity}} - \mu \cdot \underbrace{\overline{\Delta\theta}}_{\text{actuator movement}}$$
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `SAMPLING_PERIOD_MS` | 1 | One step = 1 ms |
-| `TAU_FAST_MS` | 8 | Fast EMA time constant |
-| `TAU_SLOW_MS` | 75 | Slow EMA time constant |
-| `ALPHA_FAST_Q88` | 32 (0.125) | Fast EMA alpha |
-| `ALPHA_SLOW_Q88` | 3 (≈0.012) | Slow EMA alpha |
+where:
+- $\overline{y_{\text{slow}}}$ is the mean smoothed power (higher is better),
+- $f_{\text{boundary}} \in [0, 1]$ is the fraction of sections operating in
+  the boundary zone (penalizes operating near rails),
+- $\Delta\theta = \sum_i |\theta^{(i)}_{k+1} - \theta^{(i)}_k|$ is the total
+  voltage movement (penalizes excessive actuator churn),
+- $\lambda, \mu$ are weighting constants.
 
-### FSM thresholds
+This multi-objective reward encodes the physical trade-offs: high power is the
+primary goal, but unnecessary movement and edge operation are discouraged.
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `K1_DEADZONE_Q88` | 640 (2.5σ) | Dead-zone threshold |
-| `K2_SEARCH_Q88` | 2048 (8.0σ) | SEARCH trigger threshold |
-| `HYSTERESIS_WINDOWS` | 5 | Consecutive good windows to exit SEARCH |
-| `SUDDEN_FADE_FRAC_Q88` | 64 (0.25) | y_fast < 0.75·y_slow → SEARCH |
-| `PERIODIC_PROBE_INTERVAL` | 30000 | Force SPSA every ~30 s (not in SEARCH) |
+### 7.7 Credit Assignment
 
-### Baseline
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `BASELINE_DECAY_Q88` | 1 | Slow fall: 1 LSB/ms (~30 s per dBm) |
-| `COLD_START_WARMUP` | 200 | Samples before baseline initialized |
-| `SIGMA_EPS_Q88` | 1 | Minimum sigma (avoids div-by-zero) |
-
-### Boundary zone
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `BOUNDARY_MARGIN_Q88` | 1280 (5V) | Edge band where damping starts |
-| `BOUNDARY_FLOOR_WEIGHT_Q88` | 51 (0.2) | Min perturbation weight at rail |
-| `BOUNDARY_FORCE_INWARD_Q88` | 512 (2V) | Force inward below this distance |
-
-### SPSA
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `SPSA_SETTLE_SAMPLES` | 225 (3×τ_slow) | EMA settle time per probe |
-
-### Bandit
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `NUM_ARMS` | 4 | Gain profiles |
-| `NUM_CONTEXT_BUCKETS` | 6 | 3 drift × 2 noise |
-| `BANDIT_WINDOW_ITERATIONS` | 50 | SPSA cycles between bandit updates |
-| `C_EXPLORE_Q88` | 512 (2.0) | UCB1 exploration constant |
-| `LAMBDA_BOUNDARY_Q88` | 256 (1.0) | Reward: boundary penalty weight |
-| `MU_MOVEMENT_Q88` | 256 (1.0) | Reward: movement penalty weight |
-| `DRIFT_LOW_THRESH_Q88` | 5 (≈0.02) | Below = low drift |
-| `DRIFT_HIGH_THRESH_Q88` | 50 (≈0.195) | Above = high drift |
-| `NOISE_HIGH_THRESH_Q88` | 20 (≈0.078) | Above = high noise |
-
-### Gain profiles
-
-| Profile | a_gain (Q8.8) | c_gain (Q8.8) | a (V) | c (V) |
-|---------|---------------|---------------|-------|-------|
-| Arm 0 (conservative) | 256 | 256 | 1 | 1 |
-| Arm 1 (cautious explore) | 256 | 1024 | 1 | 4 |
-| Arm 2 (aggressive exploit) | 1024 | 256 | 4 | 1 |
-| Arm 3 (aggressive explore) | 1024 | 1024 | 4 | 4 |
-| SEARCH (fixed override) | 2048 | 2048 | 8 | 8 |
+The arm is selected once per SPSA cycle and remains fixed for the entire cycle.
+The reward is attributed to the $(context, arm)$ pair that was active at the
+start of the window. In SEARCH mode, the bandit is not updated (the arm was
+not used — the SEARCH gain override was in effect), preventing contamination
+of the Q-table with rewards from a policy the bandit did not choose.
 
 ---
 
-## Cross-Module Data Flow
+## 8. Integration: How the Pieces Fit Together
 
-| Producer → Consumer | Data | Type |
-|---------------------|------|------|
-| `baseline` → `fsm` | z-score, y_fast, y_slow | `fp_t` |
-| `baseline` → `polctrl` (SPSA) | y_slow (as y_plus/y_minus) | `fp_t` |
-| `baseline` → `bandit` (context) | noise_sigma | `fp_t` |
-| `fsm` → `polctrl` | mode, should_actuate, periodic_probe, gain override | enum/uint8/profile |
-| `spsa` → `polctrl` (reward/drift) | theta, last_grad_estimate, c_k, delta | arrays |
-| `polctrl` → `spsa` | y_plus, y_minus, a_gain, c_gain, disable_boundary_weight | `fp_t`/uint8 |
-| `bandit` → `polctrl` | selected arm | uint8 |
-| `polctrl` → `bandit` | context, arm, reward | uint8/uint8/`fp_t` |
-| `drift_estimate` → `bandit` (context) | via `discretize_context` | `fp_t` |
-| `rng` (in spsa) → `spsa_compute_probe` | random ±1 signs | int8 |
+The complete algorithm is a hierarchical control loop:
+
+```mermaid
+flowchart TD
+    RAW["Raw power reading y_t"] --> EMA["Dual EMA<br/>y_fast (τ_f), y_slow (τ_s)"]
+    EMA --> CEIL["Adaptive ceiling B<br/>(asymmetric tracker)"]
+    EMA --> SIG["Noise sigma σ̂<br/>(EMA of |y − y_slow|)"]
+    CEIL --> Z["Z-score<br/>z = (B − y_slow) / σ̂"]
+    SIG --> Z
+
+    Z --> FSM["FSM<br/>TRACK / SEARCH / RECOVERY"]
+    EMA --> FADE["Sudden-fade detector<br/>y_fast ≪ y_slow?"]
+    FADE --> FSM
+
+    FSM --> |"z > k₁ or SEARCH"| TRIG["Trigger SPSA"]
+    FSM --> |"z ≤ k₁ (dead-zone)"| HOLD["Hold actuator<br/>update σ̂ only"]
+
+    TRIG --> BANDIT["Contextual bandit<br/>select (a, c) profile"]
+    BANDIT --> SPSA["SPSA cycle<br/>probe +, measure, probe −, measure, update θ"]
+    SPSA --> REWARD["Accumulate reward<br/>(power, boundary, movement)"]
+    REWARD --> |"every W cycles"| BANDIT2["Update Q-values"]
+    BANDIT2 --> BANDIT
+
+    SPSA --> ACT["Output θ to actuator"]
+    HOLD --> ACT2["Hold θ"]
+```
+
+### Timing
+
+Each SPSA cycle takes $2 \times 3\tau_s + 3 \approx 6\tau_s$ time units (two
+settling periods plus three transition steps). With $\tau_s = 75$ ms, this is
+~453 ms per cycle. The bandit is updated every $W = 50$ cycles (~22.5 s).
+
+The FSM runs every sample (1 ms), continuously monitoring for degradation
+even while an SPSA cycle is in progress. A sudden fade can interrupt the
+current cycle and force SEARCH on the next trigger.
+
+### Hierarchy of Adaptation Timescales
+
+| Component | Timescale | What it adapts |
+|-----------|-----------|----------------|
+| Fast EMA | $\tau_f \approx 8$ ms | Signal tracking (fade detection) |
+| Slow EMA | $\tau_s \approx 75$ ms | SPSA measurement (noise rejection) |
+| Noise sigma | $\sim\tau_s$ | Dead-zone threshold (scale-invariant) |
+| Adaptive ceiling (rise) | 1 step | Immediate trust of improvements |
+| Adaptive ceiling (fall) | ~30 s/dBm | Slow tracking of degradation |
+| SPSA cycle | ~450 ms | Voltage optimization |
+| Bandit update | ~22 s | Gain profile selection |
+| Drift estimate | $\sim\tau_s$ | Bandit context (drift level) |
+
+This layered structure allows the controller to react at the appropriate
+timescale for each phenomenon: fast enough to catch sudden fades within
+milliseconds, slow enough to avoid chasing noise.
+
+---
+
+## 9. Summary of Design Choices
+
+1. **No hardcoded dBm thresholds.** All decisions are based on the z-score,
+   which is normalized by the estimated noise sigma. The system adapts to
+   whatever power level and noise regime it encounters.
+
+2. **Asymmetric ceiling tracker.** Improvements are trusted immediately;
+   degradations must prove themselves over ~30 seconds. This distinguishes
+   genuine channel degradation (slow) from transient fades (fast).
+
+3. **SPSA for gradient-free optimization.** Only 2 measurements per gradient
+   estimate, regardless of dimensionality. Essential when each measurement
+   requires ~225 ms of settling time.
+
+4. **Boundary-aware perturbation.** The optimizer "tiptoes" near actuator
+   rails and forces inward perturbation when very close, preventing the
+   optimizer from getting stuck. Disabled during SEARCH for aggressive
+   recovery.
+
+5. **Contextual bandit for gain adaptation.** The UCB1 policy with a 6-bucket
+   context (drift × noise) selects from 4 gain profiles, adapting the
+   optimizer's aggressiveness to the current regime. Logarithmic regret
+   guarantee.
+
+6. **Multi-objective reward.** The bandit optimizes not just power, but also
+   penalizes actuator movement and edge operation — encoding the physical
+   trade-off between tracking performance and phase-noise minimization.
+
+7. **Hierarchical timescales.** The system reacts at the appropriate speed
+   for each phenomenon: millisecond-scale fade detection, sub-second SPSA
+   optimization, tens-of-seconds bandit adaptation.
