@@ -1,525 +1,677 @@
 # Algorithm Description
 
-> This document describes the polarization control algorithm in theoretical terms,
-> independent of any implementation. The algorithm maximizes the beat note optical
-> power in a fiber-optic link by adjusting four piezoelectric fiber squeezers.
+> This document describes the polarization control algorithm — how it decides
+> when to move the actuator, where to move it, and how aggressively. The
+> physical problem (fiber-optic frequency transfer, beat note power, Poincaré
+> sphere) is assumed known; we focus on the algorithm itself.
 
 ---
 
 ## Table of Contents
 
 1. [Problem Statement](#1-problem-statement)
-2. [System Model](#2-system-model)
-3. [Signal Conditioning: Dual-EMA and Adaptive Baseline](#3-signal-conditioning-dual-ema-and-adaptive-baseline)
-4. [State Machine: TRACK / SEARCH / RECOVERY](#4-state-machine-track--search--recovery)
-5. [SPSA Optimization](#5-spsa-optimization)
-6. [Boundary-Aware Perturbation](#6-boundary-aware-perturbation)
-7. [Contextual Bandit for Gain Adaptation](#7-contextual-bandit-for-gain-adaptation)
-8. [Integration: How the Pieces Fit Together](#8-integration-how-the-pieces-fit-together)
-9. [Summary of Design Choices](#9-summary-of-design-choices)
+2. [Signal Conditioning: Dual-EMA and Adaptive Baseline](#2-signal-conditioning-dual-ema-and-adaptive-baseline)
+3. [State Machine: TRACK / SEARCH / RECOVERY](#3-state-machine-track--search--recovery)
+4. [SPSA Optimization](#4-spsa-optimization)
+5. [Boundary-Aware Perturbation](#5-boundary-aware-perturbation)
+6. [Contextual Bandit for Gain Adaptation](#6-contextual-bandit-for-gain-adaptation)
+7. [Integration: How the Pieces Fit Together](#7-integration-how-the-pieces-fit-together)
+8. [Summary of Design Choices](#8-summary-of-design-choices)
 
 ---
 
 ## 1. Problem Statement
 
-We consider an optical fiber link used for frequency transfer. A local laser
-is combined with the incoming signal, and the resulting **beat note** power
-depends on the relative state of polarization (SOP) between the two. Environmental
-perturbations (temperature, vibration, cable movement) cause the SOP to drift
-stochastically over time.
-
-A **polarization controller** — four piezoelectric fiber squeezers acting as
-variable retarders — can compensate this drift. Each squeezer accepts a voltage
-in $[0, V_{\max}]$ and introduces a birefringence proportional to that voltage.
-The four sections are arranged in two orthogonal pairs, giving sufficient
-degrees of freedom to transform any input SOP to any target SOP on the Poincaré
-sphere.
-
-**Goal:** Maximize the beat note power (equivalently, minimize the angular
-distance between the output SOP and a reference SOP) despite:
+We have four piezoelectric fiber squeezers (actuators), each accepting a
+voltage in $[0, V_{\max}]$. The only feedback is a scalar: the (noisy) beat
+note power, sampled at regular intervals. The goal is to maximize this power
+despite:
 
 - Unknown, time-varying SOP drift (ranging from quasi-static to fast),
 - Noisy power measurements,
 - A bounded actuator range,
 - The desire to minimize unnecessary actuator movement (which itself introduces
   phase noise),
-- No knowledge of the absolute power ceiling (which may degrade over time due
-  to connector aging, bend loss, etc.).
+- No knowledge of the absolute power ceiling (which may degrade over time).
 
-The only feedback signal is a scalar: the (noisy) beat note power, sampled at
-regular intervals.
+The controller must answer three questions, every millisecond:
 
----
+1. **Should I move the actuator?** (Or is the signal good enough to leave alone?)
+2. **If yes, in what direction and by how much?**
+3. **How aggressively should I move?** (Small careful steps, or large bold ones?)
 
-## 2. System Model
+The algorithm addresses these with four cooperating components:
 
-### 2.1 Poincaré Sphere Representation
-
-The SOP is represented as a point on the unit sphere $S^2$ via the normalized
-Stokes vector $\mathbf{s} = (s_1, s_2, s_3)$ with $|\mathbf{s}| = 1$.
-
-The beat note power depends on the angular distance $\alpha$ between the
-output SOP $\mathbf{s}_{\text{out}}$ and a reference SOP $\mathbf{s}_{\text{ref}}$:
-
-$$I = \cos^2\!\left(\frac{\alpha}{2}\right), \qquad \alpha = \arccos\!\left(\frac{\mathbf{s}_{\text{out}} \cdot \mathbf{s}_{\text{ref}}}{|\mathbf{s}_{\text{out}}|\,|\mathbf{s}_{\text{ref}}|}\right)$$
-
-This is the Malus-type law: $I = 1$ when the SOPs are aligned ($\alpha = 0$),
-$I = 0.5$ when orthogonal in the Stokes sense ($\alpha = \pi/2$, 3 dB loss),
-and $I = 0$ when antiparallel ($\alpha = \pi$).
-
-The power in dBm is:
-
-$$P = P_{\text{ceiling}} + 10 \log_{10}(I + \varepsilon)$$
-
-where $P_{\text{ceiling}}$ is the best achievable power (when $I = 1$) and
-$\varepsilon$ is a small constant to avoid $\log(0)$.
-
-### 2.2 Actuator Model
-
-The four sections act as sequential retarders. Sections $\{1, 2\}$ rotate the
-SOP around axis $\mathbf{e}_1 = (1, 0, 0)$; sections $\{3, 4\}$ around the
-orthogonal axis $\mathbf{e}_2 = (0, 1, 0)$. The rotation angle of section $i$
-is $\phi_i = (V_i / V_{\max}) \cdot 2\pi$.
-
-The output SOP is:
-
-$$\mathbf{s}_{\text{out}} = R_4 \, R_3 \, R_2 \, R_1 \, \mathbf{s}_{\text{in}}$$
-
-where $R_i$ is the rotation matrix (Rodrigues' formula) for section $i$. The
-input SOP $\mathbf{s}_{\text{in}}$ is subject to environmental drift.
-
-### 2.3 Drift Model
-
-The input SOP drifts according to an Ornstein-Uhlenbeck (OU) process on the
-sphere:
-
-$$dX = -\frac{X}{\tau} \, dt + \sigma \, dW$$
-
-applied to the azimuthal and elevational angles independently, where $\tau$ is
-the time constant (larger $\tau$ = slower drift), $\sigma$ is the diffusion
-amplitude, and $W$ is a Wiener process. This produces correlated, mean-reverting
-drift — more realistic than white noise.
-
-### 2.4 Measurement Noise
-
-Two noise regimes are modeled:
-
-1. **White Gaussian:** $P_{\text{obs}} = P + \mathcal{N}(0, \sigma_n)$
-2. **Interferometric:** A composite of multiple sinusoidal components (parasitic
-   interferometers beating at different frequencies) plus a white component.
-   This is structurally non-Gaussian and non-stationary.
+| Component | Answers | Core idea |
+|-----------|---------|-----------|
+| Adaptive baseline + sigma | Question 1 | Track the achievable ceiling and noise floor without hardcoded thresholds |
+| FSM (TRACK / SEARCH / RECOVERY) | Question 1 | Decide *when* to actuate, with hysteresis to prevent oscillation |
+| SPSA optimizer | Question 2 | Estimate the gradient with only 2 power measurements per step |
+| Contextual bandit (UCB1) | Question 3 | Learn which aggressiveness level works best for the current drift/noise regime |
 
 ---
 
-## 3. Signal Conditioning: Dual-EMA and Adaptive Baseline
+## 2. Signal Conditioning: Dual-EMA and Adaptive Baseline
 
-### 3.1 Dual Exponential Moving Average
+Before any decision is made, the raw power reading must be cleaned up. The
+raw signal is noisy, and we need to distinguish "noise" from "real degradation."
+This section describes how.
 
-Two EMAs of the raw power reading $y_t$ are maintained:
+### 2.1 Exponential Moving Average (EMA)
 
-$$y_{\text{fast}}^{(t)} = y_{\text{fast}}^{(t-1)} + \alpha_f \left( y_t - y_{\text{fast}}^{(t-1)} \right), \qquad \alpha_f = \frac{\Delta t}{\tau_f}$$
+An **Exponential Moving Average** (EMA) is a weighted average where recent
+samples carry more weight than old ones. At each time step, the EMA moves
+a fraction $\alpha$ of the way toward the new reading:
 
-$$y_{\text{slow}}^{(t)} = y_{\text{slow}}^{(t-1)} + \alpha_s \left( y_t - y_{\text{slow}}^{(t-1)} \right), \qquad \alpha_s = \frac{\Delta t}{\tau_s}$$
+$$y_{\text{ema}}^{(t)} = y_{\text{ema}}^{(t-1)} + \alpha \cdot \left( y_{\text{raw}}^{(t)} - y_{\text{ema}}^{(t-1)} \right)$$
 
-with $\tau_f \ll \tau_s$ (e.g., $\tau_f = 8$ ms, $\tau_s = 75$ ms).
+- $\alpha = 0$: the EMA never moves (ignores all new data).
+- $\alpha = 1$: the EMA always equals the latest reading (no smoothing).
+- $\alpha$ small: strong smoothing, slow response.
+- $\alpha$ large: weak smoothing, fast response.
 
-| Signal | Time constant | Role |
-|--------|--------------|------|
-| $y_{\text{fast}}$ | $\tau_f$ (short) | Tracks the signal quickly; used for sudden-fade detection |
-| $y_{\text{slow}}$ | $\tau_s$ (long) | Smoothed signal; used as the SPSA measurement and baseline reference |
+The **time constant** $\tau$ (the time for the EMA to reach ~63% of a step
+change) is related to $\alpha$ by $\alpha \approx \Delta t / \tau$, where
+$\Delta t$ is the sampling interval.
 
-### 3.2 Adaptive Ceiling (Asymmetric Tracker)
+### 2.2 Dual-EMA: Fast and Slow
 
-The estimated achievable power ceiling $B_t$ is updated by an **asymmetric
-integrator**:
+The controller maintains **two** EMAs of the raw power reading, with different
+time constants:
 
-$$B_{t+1} = \begin{cases} y_{\text{slow}}^{(t)} & \text{if } y_{\text{slow}}^{(t)} > B_t \quad \text{(fast rise)} \\ B_t - \delta & \text{otherwise} \quad \text{(slow linear decay)} \end{cases}$$
+| EMA | Time constant | Smoothing | Purpose |
+|-----|--------------|-----------|---------|
+| $y_{\text{fast}}$ | $\tau_f \approx 8$ ms | Light | Tracks the signal quickly; detects sudden drops |
+| $y_{\text{slow}}$ | $\tau_s \approx 75$ ms | Heavy | Smoothed signal; used for measurements and as baseline reference |
 
-where $\delta$ is a small constant step (one least-significant-bit per sample).
+```mermaid
+graph LR
+    RAW["Raw reading<br/>(noisy)"] --> FAST["y_fast<br/>(τ = 8 ms)"]
+    RAW --> SLOW["y_slow<br/>(τ = 75 ms)"]
+    FAST --> |"tracks quickly"| OUT1["Signal level"]
+    SLOW --> |"tracks slowly,<br/>rejects noise"| OUT2["Smoothed level"]
+```
 
-**Rationale:** This design encodes an asymmetric belief about the signal:
-improvements are trusted immediately (the ceiling snaps up), while degradations
-are treated with skepticism (the ceiling leaks downward slowly, over ~30 s per
-dBm). This means:
+**Why two?** The fast EMA reacts quickly but is noisy; the slow EMA is smooth
+but lags. The *gap* between them carries information: if the signal is stable,
+they agree. If the signal drops suddenly, $y_{\text{fast}}$ falls first while
+$y_{\text{slow}}$ still holds the old (higher) value — the gap reveals the
+drop before the slow EMA catches up.
 
-- A **genuine ceiling drop** (e.g., connector degradation at ~1 dBm/s) is
-  tracked, keeping the gap $B - y_{\text{slow}}$ small and avoiding false
-  alarms.
-- A **transient dip** (sudden fade, faster than 30 s) is faster than the leak,
-  so the ceiling holds high, the gap widens, and the z-score spikes — correctly
-  triggering aggressive search.
+**Example:** A sudden 10 dB drop at $t = 100$ ms:
 
-### 3.3 Noise Sigma Estimation
+```
+Power
+  │
+  │─────╮               ← true signal (step drop)
+  │     │
+  │     ╰──────────────
+  │
+  │─────╮
+  │      ╲              ← y_fast (starts dropping within ~8 ms)
+  │       ╲
+  │        ╰───────────
+  │
+  │─────╮
+  │      ╲              ← y_slow (starts dropping within ~75 ms,
+  │       ╲                still high when y_fast has already fallen)
+  │        ╲
+  │         ╰──────────
+  └──────────────────────→ t (ms)
+        100
+```
 
-The noise standard deviation $\hat{\sigma}_n$ is estimated as an EMA of the
-absolute residual:
+At $t \approx 108$ ms, $y_{\text{fast}}$ has already dropped significantly,
+but $y_{\text{slow}}$ is still near the old level. This gap triggers the
+sudden-fade detector (§3.1).
 
-$$\hat{\sigma}_n^{(t)} = \hat{\sigma}_n^{(t-1)} + \alpha_s \left( |y_t - y_{\text{slow}}^{(t)}| - \hat{\sigma}_n^{(t-1)} \right)$$
+### 2.3 Adaptive Ceiling: The Asymmetric Tracker
 
-This update is performed **only when the controller is in dead-zone** (i.e.,
-the signal is considered stable and no active probing is occurring). This
-prevents contamination of the noise estimate by real signal changes during
-optimization or recovery.
+The controller needs to know "what power level is achievable right now?" —
+the **ceiling**. This is not a fixed threshold; it changes as the channel
+degrades or as the controller finds better alignments.
 
-### 3.4 Z-Score
+The ceiling $B$ is updated by an **asymmetric integrator**:
 
-The normalized degradation signal is:
+$$B_{t+1} = \begin{cases} y_{\text{slow}}^{(t)} & \text{if } y_{\text{slow}}^{(t)} > B_t \quad \text{(rise: immediate)} \\ B_t - \delta & \text{otherwise} \quad \text{(fall: slow leak)} \end{cases}$$
+
+where $\delta$ is a tiny constant (one least-significant-bit per sample).
+
+**Intuition:** "Believe good news immediately, be skeptical of bad news."
+
+- If the smoothed power *exceeds* the current ceiling, the controller has found
+  a better operating point. The ceiling snaps up instantly — there is no reason
+  to doubt an improvement.
+- If the smoothed power is *below* the ceiling, the ceiling doesn't drop to
+  meet it. Instead, it leaks downward at a glacial pace (~30 seconds per dBm).
+  This is because a dip could be transient (a fade that will recover) rather
+  than a genuine ceiling drop.
+
+```mermaid
+graph LR
+    subgraph "Ceiling behavior"
+        A["y_slow rises<br/>above B"] --> B1["B jumps up<br/>(immediate)"]
+        C["y_slow falls<br/>below B"] --> D["B leaks down<br/>by δ per sample<br/>(~30 s/dBm)"]
+    end
+```
+
+**Why asymmetric?** Consider two scenarios:
+
+1. **Connector degradation** (slow, ~1 dBm/s): The true ceiling drops gradually.
+   The slow leak (30 s/dBm) is slow, but the degradation is slower still — the
+   ceiling follows it, keeping the gap $B - y_{\text{slow}}$ small. No false
+   alarm.
+
+2. **Sudden fade** (fast, 10 dBm in 100 ms): The true signal drops, but the
+   ceiling can't leak that fast. The gap $B - y_{\text{slow}}$ widens
+   rapidly, the z-score (§2.5) spikes, and SEARCH is triggered. Correct
+   response.
+
+### 2.4 Noise Sigma Estimation
+
+To decide whether a signal change is "real" or "just noise," we need to know
+how much noise there is. The noise standard deviation $\hat{\sigma}_n$ is
+estimated as an EMA of the **absolute residual** — how far each raw reading
+deviates from the slow EMA:
+
+$$\hat{\sigma}_n^{(t)} = \hat{\sigma}_n^{(t-1)} + \alpha_s \left( \left| y_{\text{raw}}^{(t)} - y_{\text{slow}}^{(t)} \right| - \hat{\sigma}_n^{(t-1)} \right)$$
+
+Intuitively: if the raw signal jiggles ±0.5 dBm around the smooth trend, then
+$|y_{\text{raw}} - y_{\text{slow}}| \approx 0.5$ on average, and $\hat{\sigma}_n$
+converges to ~0.5.
+
+**Critical detail:** This update runs **only when the controller is in
+dead-zone** (signal is stable, no probing). During active optimization or
+recovery, the signal changes are *real* (the controller moved the actuator),
+not noise. Updating sigma then would contaminate the estimate.
+
+### 2.5 Z-Score: The Scale-Invariant Degradation Signal
+
+The **z-score** normalizes the gap to the ceiling by the noise level:
 
 $$z_t = \frac{B_t - y_{\text{slow}}^{(t)}}{\max(\hat{\sigma}_n, \, \varepsilon)}$$
 
-This is **scale-invariant**: it expresses the gap to the ceiling in units of
-the estimated noise standard deviation. The thresholds $k_1$ and $k_2$ (see
-§4) are defined in these units, so they work regardless of the absolute power
-level or noise amplitude. No hardcoded dBm values appear anywhere in the
-decision logic.
+This answers: "How many noise-sigmas below the ceiling are we?"
 
-### 3.5 Cold Start
+- $z \approx 0$: we're at the ceiling, everything is fine.
+- $z = 2.5$: we're 2.5 noise-sigmas below the ceiling — probably a real
+  degradation, worth investigating.
+- $z = 8$: we're 8 noise-sigmas below — severe degradation, need aggressive
+  search.
 
-During an initial warmup period (e.g., 200 samples), the ceiling is
-uninitialized and $z_t$ is set to $+\infty$, forcing the controller into
-SEARCH mode. After warmup, $B$ is initialized to $y_{\text{slow}}$ and normal
-operation begins.
+**Why scale-invariant?** The thresholds (2.5σ, 8σ) are defined in *units of
+the noise*, not in absolute dBm. So they work whether the ceiling is −38 dBm
+with 0.3 dBm noise, or −50 dBm with 2 dBm noise. No hardcoded dBm values
+anywhere in the decision logic.
+
+### 2.6 Cold Start
+
+At system startup, the ceiling is unknown. For the first 200 samples (~200 ms),
+the z-score is set to $+\infty$, forcing the controller into SEARCH mode. After
+warmup, $B$ is initialized to $y_{\text{slow}}$ and normal operation begins.
 
 ---
 
-## 4. State Machine: TRACK / SEARCH / RECOVERY
+## 3. State Machine: TRACK / SEARCH / RECOVERY
 
-The controller operates in one of three modes, governed by the z-score and
-a sudden-fade detector.
+The controller operates in one of three modes. The transitions are governed
+by the z-score (§2.5) and the sudden-fade detector.
 
 ```mermaid
 stateDiagram-v2
     [*] --> TRACK
 
-    TRACK --> SEARCH: z > k₂ OR sudden fade
-    SEARCH --> RECOVERY: z < k₁
-    RECOVERY --> TRACK: N consecutive windows with z < k₁
-    RECOVERY --> SEARCH: z > k₂ (regression)
+    TRACK --> SEARCH: z > 8σ (severe degradation)\nOR sudden fade
+    SEARCH --> RECOVERY: z < 2.5σ (signal recovered)
+    RECOVERY --> TRACK: 5 consecutive windows\nwith z < 2.5σ (hysteresis)
+    RECOVERY --> SEARCH: z > 8σ (regression)
 ```
 
-### 4.1 Sudden-Fade Detection
+### 3.1 Sudden-Fade Detection
 
-Before the z-score is evaluated, a heuristic checks for rapid signal drops:
+Before evaluating the z-score, a heuristic checks for rapid signal drops using
+the two EMAs:
 
-$$\text{if } \left( y_{\text{slow}} - y_{\text{fast}} \right) > \beta \cdot y_{\text{slow}} \quad \text{then SEARCH}$$
+$$\text{if } \left( y_{\text{slow}} - y_{\text{fast}} \right) > 0.25 \cdot y_{\text{slow}} \quad \Longrightarrow \quad \text{SEARCH}$$
 
-with $\beta = 0.25$ (the fast EMA has dropped more than 25% below the slow EMA).
+In words: if the fast EMA has dropped more than 25% below the slow EMA,
+declare a sudden fade. This works because $y_{\text{fast}}$ reacts ~9× faster
+than $y_{\text{slow}}$, so a sharp drop opens a visible gap between them before
+the z-score (which uses the lagging $y_{\text{slow}}$) can register.
 
-Since $y_{\text{fast}}$ reacts approximately $\tau_s / \tau_f \approx 9\times$
-faster than $y_{\text{slow}}$, a sharp drop opens a large gap between the two
-EMAs before the z-score (which uses the lagging $y_{\text{slow}}$) can register.
-This provides a fast detection path independent of the sigma estimate, which
-may be unreliable during transients.
+**Why not just use the z-score?** The z-score depends on $\hat{\sigma}_n$,
+which may be stale or unreliable during transients. The sudden-fade detector
+is a simple, robust heuristic that catches the most dangerous case (cable hit,
+connector disconnect) within milliseconds, without relying on sigma.
 
-### 4.2 Transitions
+### 3.2 Transitions
 
-| Transition | Condition | Notes |
-|------------|-----------|-------|
-| TRACK → SEARCH | $z > k_2$ or sudden fade | $k_2 = 8\sigma$: severe degradation |
-| SEARCH → RECOVERY | $z < k_1$ | $k_1 = 2.5\sigma$: signal recovered to dead-zone |
-| RECOVERY → TRACK | $N$ consecutive windows with $z < k_1$ | $N = 5$: hysteresis prevents oscillation |
-| RECOVERY → SEARCH | $z > k_2$ | Regression: signal degraded again |
+| Transition | Condition | Rationale |
+|------------|-----------|-----------|
+| TRACK → SEARCH | $z > 8\sigma$ or sudden fade | Severe degradation: abandon fine-tuning, search aggressively |
+| SEARCH → RECOVERY | $z < 2.5\sigma$ | Signal has recovered to the dead-zone |
+| RECOVERY → TRACK | 5 consecutive windows with $z < 2.5\sigma$ | Hysteresis: don't declare "recovered" until the signal has been stable for a while |
+| RECOVERY → SEARCH | $z > 8\sigma$ | Regression: the recovery didn't hold |
 
-### 4.3 Dead-Zone Gate
+### 3.3 Dead-Zone Gate
 
-The dead-zone gate determines whether the optimizer should actuate:
+The **dead-zone** is the core mechanism for minimizing unnecessary actuator
+movement. The optimizer is only allowed to actuate when:
 
-$$\text{actuate} = \begin{cases} \text{true} & \text{if mode = SEARCH} \\ \text{true} & \text{if } z > k_1 \quad \text{(TRACK or RECOVERY)} \\ \text{false} & \text{otherwise (dead-zone: signal is stable)} \end{cases}$$
+$$\text{actuate} = \begin{cases} \text{yes} & \text{if in SEARCH (always)} \\ \text{yes} & \text{if } z > 2.5\sigma \text{ (degradation exceeds noise)} \\ \text{no} & \text{otherwise (dead-zone: signal is stable)} \end{cases}$$
 
-When in the dead-zone, the controller does not move the actuator — it only
-monitors. This reduces unnecessary phase noise from piezo movement.
+When in the dead-zone, the controller does nothing — it only monitors. This
+is by design: every piezo movement introduces phase noise, so the best move
+is no move when the signal is already good.
 
-### 4.4 Periodic Probe
+### 3.4 Periodic Probe
 
-Even in the dead-zone, a single optimization round is forced every $T_{\text{probe}}$
-(e.g., 30 s). This serves two purposes: (1) re-confirm that the current operating
-point is still optimal, and (2) provide exploration data to the bandit. The
-periodic probe is disabled in SEARCH mode (where exploration is already
+Even in the dead-zone, a single optimization round is forced every ~30 seconds.
+This serves two purposes:
+
+1. **Re-confirm the optimum:** The drift may be so slow that the z-score never
+   exceeds 2.5σ, but the operating point could still be slightly suboptimal.
+   A periodic probe checks.
+2. **Feed the bandit:** The bandit needs exploration data to learn which gain
+   profile works best. Without periodic probes, the bandit would never get
+   data in the stable regime.
+
+The periodic probe is disabled in SEARCH (where exploration is already
 continuous).
 
 ---
 
-## 5. SPSA Optimization
+## 4. SPSA Optimization
 
-### 5.1 The SPSA Principle
+### 4.1 The Problem
 
-The **Simultaneous Perturbation Stochastic Approximation** (Spall, 1992)
-estimates the gradient of an objective function $f(\boldsymbol{\theta})$ using
-only **two** function evaluations per iteration, regardless of the dimensionality
-of $\boldsymbol{\theta}$.
+We want to maximize the beat note power by adjusting 4 voltages. This is a
+4-dimensional optimization problem. The challenge: we can't compute the
+gradient analytically (the relationship between voltages and power is
+determined by the physical fiber link), and each function evaluation (power
+measurement) is expensive — it requires ~225 ms of settling time.
 
-For a parameter vector $\boldsymbol{\theta} \in \mathbb{R}^d$ ($d = 4$ here),
-the SPSA gradient estimate at iteration $k$ is:
+A standard finite-difference approach would need $2 \times 4 = 8$ measurements
+per gradient step (perturb each of the 4 axes one at a time). SPSA needs only
+**2**, regardless of dimensionality.
 
-$$\hat{g}_k^{(i)} = \frac{f(\boldsymbol{\theta}_k + c_k \boldsymbol{\Delta}_k) - f(\boldsymbol{\theta}_k - c_k \boldsymbol{\Delta}_k)}{2 \, c_k \, \Delta_k^{(i)}}$$
+### 4.2 The SPSA Idea
 
-where:
-- $\boldsymbol{\Delta}_k = (\Delta_k^{(1)}, \ldots, \Delta_k^{(d)})$ is a random
-  perturbation vector with each component $\Delta_k^{(i)} \in \{-1, +1\}$,
-  drawn independently,
-- $c_k > 0$ is the perturbation magnitude.
+**Simultaneous Perturbation Stochastic Approximation** (Spall, 1992) estimates
+the gradient by perturbing **all** coordinates at once, with random signs,
+and measuring the power at two points:
 
-The parameter update is:
+1. Pick a random direction $\boldsymbol{\Delta} = (\pm 1, \pm 1, \pm 1, \pm 1)$
+   — each component is independently +1 or −1 with equal probability.
+2. Measure power at $\boldsymbol{\theta} + c \cdot \boldsymbol{\Delta}$ (call it $y_+$).
+3. Measure power at $\boldsymbol{\theta} - c \cdot \boldsymbol{\Delta}$ (call it $y_-$).
+4. Estimate the gradient:
 
-$$\boldsymbol{\theta}_{k+1} = \boldsymbol{\theta}_k + a_k \, \hat{\mathbf{g}}_k$$
+$$\hat{g}_i = \frac{y_+ - y_-}{2 \, c \, \Delta_i}$$
 
-where $a_k > 0$ is the step size (gain).
+5. Update: $\boldsymbol{\theta} \leftarrow \boldsymbol{\theta} + a \cdot \hat{\mathbf{g}}$.
 
-**Key advantage:** Only 2 measurements are needed per gradient estimate,
-whether $d = 4$ or $d = 100$. This is critical when each measurement is
-expensive (here, each requires settling time for the EMA to converge).
+**Intuition:** Imagine you're blindfolded on a hill and want to go up. You
+can't measure the slope in each direction separately (too expensive). Instead,
+you toss a 4-dimensional coin to pick a random diagonal direction, take one
+step that way, measure your height, then take one step in the opposite
+direction and measure again. If you went *up* in the +direction, the gradient
+probably points that way; if *down*, it points the other way. The random
+direction "mixes" all 4 coordinates, but on average, the estimate is unbiased.
 
-### 5.2 Measurement Protocol
+**Worked example (2D):** Suppose the true power landscape is
+$f(\theta) = -(\theta_1 - 20)^2 - (\theta_2 - 40)^2$, and we're at
+$\boldsymbol{\theta} = (15, 35)$. We pick $\boldsymbol{\Delta} = (+1, -1)$,
+$c = 2$.
 
-Each SPSA iteration consists of:
+- $y_+ = f(17, 33) = -9 - 49 = -58$
+- $y_- = f(13, 37) = -49 - 9 = -58$
+- $\hat{g}_1 = (-58 - (-58)) / (2 \cdot 2 \cdot 1) = 0$
+- $\hat{g}_2 = (-58 - (-58)) / (2 \cdot 2 \cdot (-1)) = 0$
 
-1. Generate random perturbation $\boldsymbol{\Delta}_k$.
-2. Set actuator to $\boldsymbol{\theta}_k + c_k \boldsymbol{\Delta}_k$ (probe point +).
-3. Wait for the slow EMA to settle (time $\approx 3\tau_s$ for 95% convergence).
-4. Record $y_+ = y_{\text{slow}}$ (the smoothed power at probe +).
-5. Set actuator to $\boldsymbol{\theta}_k - c_k \boldsymbol{\Delta}_k$ (probe point −).
-6. Wait for settling.
-7. Record $y_- = y_{\text{slow}}$.
-8. Compute $\hat{\mathbf{g}}_k$ and update $\boldsymbol{\theta}_{k+1}$.
+This particular perturbation gave a zero gradient (bad luck — the random
+direction happened to be along a contour line). But over many iterations with
+different random $\boldsymbol{\Delta}$, the *average* gradient estimate points
+toward $(20, 40)$. That's the stochastic nature of SPSA: individual steps are
+noisy, but the trajectory converges.
 
-Using $y_{\text{slow}}$ rather than the raw reading as the measurement rejects
-measurement noise (the EMA acts as a low-pass filter).
+### 4.3 Measurement Protocol
 
-### 5.3 Per-Coordinate Perturbation
+Each SPSA iteration is a multi-step procedure:
 
-The perturbation magnitude $c_k$ is applied **per coordinate**, but each
-coordinate $i$ may have a different effective magnitude $c_k^{(i)} = c_k \cdot w(\theta_k^{(i)})$,
-where $w$ is the boundary weight (see §6). The gradient formula becomes:
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant A as Actuator
+    participant D as Detector
 
-$$\hat{g}_k^{(i)} = \frac{y_+ - y_-}{2 \, c_k^{(i)} \, \Delta_k^{(i)}}$$
+    C->>A: Set voltages to θ + c·Δ (probe +)
+    Note over D: Wait 3τ_s (~225 ms) for EMA to settle
+    C->>D: Record y₊ = y_slow (smoothed power)
 
-### 5.4 Gain Profiles
+    C->>A: Set voltages to θ − c·Δ (probe −)
+    Note over D: Wait 3τ_s (~225 ms)
+    C->>D: Record y₋ = y_slow
 
-The gains $(a, c)$ are not fixed — they are selected by the contextual bandit
-(see §7) from a discrete set of profiles:
+    C->>C: Compute gradient ĝ = (y₊ − y₋) / (2cΔ)
+    C->>C: Update θ ← θ + a·ĝ
+    C->>A: Set voltages to new θ
+```
 
-| Profile | $a$ (step size) | $c$ (perturbation) | Character |
-|---------|-----------------|---------------------|-----------|
-| 0 | small | small | Conservative (fine-tune near optimum) |
-| 1 | small | large | Cautious exploration |
-| 2 | large | small | Aggressive exploitation |
-| 3 | large | large | Aggressive exploration |
-| SEARCH | very large | very large | Fixed override (recovery from large perturbation) |
+**Why use $y_{\text{slow}}$ and not the raw reading?** Each power measurement
+is noisy. The slow EMA averages out the noise over ~75 ms, giving a stable
+reading. We wait $3\tau_s$ (~225 ms) for the EMA to settle to 95% of the new
+level after a voltage change. This makes each SPSA cycle take ~450 ms — slow,
+but necessary for reliable gradient estimates.
+
+### 4.4 Per-Coordinate Perturbation Size
+
+The perturbation magnitude $c$ is not uniform across all 4 sections. Each
+section $i$ gets $c^{(i)} = c \cdot w(\theta^{(i)})$, where $w$ is the boundary
+weight (§5). Near the actuator rails, $w$ shrinks, so the perturbation is
+smaller — the optimizer "tiptoes" near edges.
+
+The gradient formula becomes:
+
+$$\hat{g}_i = \frac{y_+ - y_-}{2 \, c^{(i)} \, \Delta_i}$$
+
+### 4.5 Gain Profiles
+
+The gains $(a, c)$ — step size and perturbation size — are not fixed. They
+are selected by the contextual bandit (§6) from a discrete set:
+
+| Profile | Step size $a$ | Perturbation $c$ | When it's useful |
+|---------|---------------|-------------------|------------------|
+| 0 | small | small | Fine-tuning near the optimum (stable, low drift) |
+| 1 | small | large | Cautious exploration (uncertain landscape) |
+| 2 | large | small | Aggressive exploitation (know the direction, go fast) |
+| 3 | large | large | Aggressive exploration (fast drift, need to cover ground) |
+| SEARCH | very large | very large | Recovery from large perturbation (fixed override) |
 
 In SEARCH mode, the bandit is bypassed and a fixed aggressive profile is used.
 
 ---
 
-## 6. Boundary-Aware Perturbation
+## 5. Boundary-Aware Perturbation
 
-### 6.1 Problem
+### 5.1 The Problem
 
-The actuator voltages are bounded: $\theta^{(i)} \in [0, V_{\max}]$. Near the
+Actuator voltages are bounded: $\theta^{(i)} \in [0, V_{\max}]$. Near the
 rails, two issues arise:
-- Random perturbations may push the voltage beyond the range (wasting a
-  measurement).
-- The optimizer may get "stuck" against a rail, unable to explore the
-  gradient in one direction.
 
-### 6.2 Perturbation Damping
+1. **Wasted probes:** A random perturbation might push the voltage beyond the
+   range, where it gets clamped. The probe is no longer symmetric, so the
+   gradient estimate is biased.
+2. **Getting stuck:** If $\theta^{(i)}$ is at 0V, the optimizer can't probe
+   in the negative direction. It only sees the positive side and might
+   conclude "the gradient is zero" when it's actually negative.
 
-A weight function reduces the perturbation magnitude near the rails:
+### 5.2 Perturbation Damping
 
-$$w(\theta) = \begin{cases} 1 & \text{if } m \leq \theta \leq V_{\max} - m \\ w_{\min} + (1 - w_{\min}) \cdot \frac{d(\theta)}{m} & \text{otherwise} \end{cases}$$
+A weight function $w(\theta)$ reduces the perturbation magnitude near the
+rails:
 
-where:
-- $m$ is the margin (e.g., 5V) within which damping is active,
-- $d(\theta) = \min(\theta, \, V_{\max} - \theta)$ is the distance to the nearest rail,
-- $w_{\min}$ is the floor weight (e.g., 0.2).
+$$w(\theta) = \begin{cases} 1.0 & \text{if } m \leq \theta \leq V_{\max} - m \\ 0.2 + 0.8 \cdot \frac{d}{m} & \text{otherwise} \end{cases}$$
 
-```mermaid
-graph LR
-    A["θ = 0<br/>w = 0.2"] --> B["θ = m<br/>w = 1.0"]
-    B --> C["θ = V_max/2<br/>w = 1.0"]
-    C --> D["θ = V_max − m<br/>w = 1.0"]
-    D --> E["θ = V_max<br/>w = 0.2"]
+where $m$ is the margin (e.g., 5V) and $d$ is the distance to the nearest rail.
+
+```
+Weight
+  │
+1.0│────────────────────────────────────────────
+  │         ╱                          ╲
+  │       ╱                              ╲
+  │     ╱                                  ╲
+0.2│   ●                                      ●
+  └───┬──────┬──────────────────────┬──────┬───→ Voltage
+      0V    5V                     55V    60V
+           ←m→                    ←m→
+         (damping zone)        (damping zone)
 ```
 
-The effective perturbation is $c^{(i)} = c \cdot w(\theta^{(i)})$. At the rail,
-the perturbation shrinks to 20% of nominal, making the optimizer "tiptoe" near
-edges.
+At the rail (0V or 60V), the perturbation shrinks to 20% of nominal. In the
+center (5V–55V), it's full strength. The optimizer moves carefully when near
+edges and freely when in the open.
 
-### 6.3 Forced Inward Direction
+### 5.3 Forced Inward Direction
 
-When the actuator is within a very small margin $m_{\text{inward}}$ (e.g., 2V)
-of a rail, the perturbation direction is forced inward rather than random:
+When the actuator is *very* close to a rail (within $m_{\text{inward}}$,
+e.g., 2V), the random perturbation direction is overridden:
 
-$$\Delta_k^{(i)} = \begin{cases} +1 & \text{if } \theta^{(i)} < m_{\text{inward}} \\ -1 & \text{if } \theta^{(i)} > V_{\max} - m_{\text{inward}} \\ \text{random } \pm 1 & \text{otherwise} \end{cases}$$
+| Position | Direction | Why |
+|----------|-----------|-----|
+| $\theta < 2$V | $\Delta = +1$ (always probe upward) | Can't probe downward — force inward |
+| $\theta > 58$V | $\Delta = -1$ (always probe downward) | Can't probe upward — force inward |
+| Otherwise | $\Delta = \pm 1$ (random) | Normal operation |
 
-This guarantees that the next probe moves away from the rail, preventing
-the optimizer from being stuck.
+This guarantees the probe always moves away from the rail, preventing the
+optimizer from being stuck.
 
-### 6.4 Disabled in SEARCH
+### 5.4 Disabled in SEARCH
 
-During SEARCH, the boundary weighting is disabled ($w \equiv 1$), and the full
-perturbation magnitude is used everywhere. This is a deliberate trade-off: in
-SEARCH, the system is far from the optimum and needs aggressive exploration
-across the entire range. Edge-avoidance would slow recovery.
-
----
-
-## 7. Contextual Bandit for Gain Adaptation
-
-### 7.1 Motivation
-
-The optimal SPSA gains $(a, c)$ depend on the operating conditions:
-- **Slow drift, low noise:** small gains suffice (fine-tune and hold),
-- **Fast drift, high noise:** large gains needed (track aggressively despite
-  noise).
-
-Since the drift regime changes over time, a fixed gain profile is suboptimal.
-We use a **contextual bandit** to adaptively select the gain profile based on
-the current drift/noise context.
-
-### 7.2 Contextual Bandit Framework
-
-A contextual bandit is a sequential decision problem where, at each round $t$:
-1. The agent observes a **context** $\mathbf{x}_t$,
-2. Selects an **arm** (action) $a_t$ from a set of $K$ arms,
-3. Receives a **reward** $r_t$,
-4. Updates its policy.
-
-The goal is to minimize cumulative regret: the gap between the reward of the
-best arm for each context and the reward actually obtained.
-
-### 7.3 Context Discretization
-
-The context is two-dimensional: $(\hat{d}_t, \hat{\sigma}_n)$, where:
-- $\hat{d}_t$ is the estimated drift rate (EMA of the mean gradient magnitude
-  $\frac{1}{d}\sum_i |\hat{g}^{(i)}_k|$, smoothed over iterations),
-- $\hat{\sigma}_n$ is the estimated noise sigma (from §3.3).
-
-This is discretized into $3 \times 2 = 6$ buckets:
-
-| | Low noise | High noise |
-|---|-----------|------------|
-| Low drift | Bucket 0 | Bucket 1 |
-| Mid drift | Bucket 2 | Bucket 3 |
-| High drift | Bucket 4 | Bucket 5 |
-
-### 7.4 UCB1 Policy
-
-The arm is selected using the **UCB1** algorithm (Auer, Cesa-Bianchi, Fischer
-2002), which balances exploration and exploitation:
-
-$$a_t = \arg\max_a \left[ Q(b, a) + C \sqrt{\frac{\ln(N+1)}{n(b,a)+1}} \right]$$
-
-where:
-- $Q(b, a)$ is the estimated mean reward for arm $a$ in bucket $b$,
-- $n(b, a)$ is the number of times arm $a$ has been selected in bucket $b$,
-- $N$ is the total number of pulls across all arms in bucket $b$,
-- $C$ is the exploration constant (e.g., $C = 2.0$).
-
-The first term exploits the arm with the highest observed reward; the second
-term (the **exploration bonus**) favors arms that have been tried less often.
-UCB1 has a logarithmic regret guarantee: $R_T = O(\log T)$.
-
-### 7.5 Q-Value Update
-
-After receiving reward $r_t$, the Q-value is updated via an EMA:
-
-$$Q(b, a) \leftarrow Q(b, a) + \alpha \cdot (r_t - Q(b, a))$$
-
-with $\alpha = 1 / \min(n(b,a), \, n_{\max})$. The cap $n_{\max}$ (e.g., 255)
-prevents the learning rate from becoming negligibly small — the Q-value
-continues to adapt slowly even after many pulls, rather than freezing.
-
-### 7.6 Reward Design
-
-The reward is computed as the average over a window of $W$ SPSA iterations
-(e.g., $W = 50$):
-
-$$r = \underbrace{\overline{y_{\text{slow}}}}_{\text{sustained power}} - \lambda \cdot \underbrace{\overline{f_{\text{boundary}}}}_{\text{edge proximity}} - \mu \cdot \underbrace{\overline{\Delta\theta}}_{\text{actuator movement}}$$
-
-where:
-- $\overline{y_{\text{slow}}}$ is the mean smoothed power (higher is better),
-- $f_{\text{boundary}} \in [0, 1]$ is the fraction of sections operating in
-  the boundary zone (penalizes operating near rails),
-- $\Delta\theta = \sum_i |\theta^{(i)}_{k+1} - \theta^{(i)}_k|$ is the total
-  voltage movement (penalizes excessive actuator churn),
-- $\lambda, \mu$ are weighting constants.
-
-This multi-objective reward encodes the physical trade-offs: high power is the
-primary goal, but unnecessary movement and edge operation are discouraged.
-
-### 7.7 Credit Assignment
-
-The arm is selected once per SPSA cycle and remains fixed for the entire cycle.
-The reward is attributed to the $(context, arm)$ pair that was active at the
-start of the window. In SEARCH mode, the bandit is not updated (the arm was
-not used — the SEARCH gain override was in effect), preventing contamination
-of the Q-table with rewards from a policy the bandit did not choose.
+During SEARCH, boundary weighting is disabled ($w \equiv 1$ everywhere). This
+is a deliberate trade-off: in SEARCH, the system is far from the optimum and
+needs aggressive exploration across the *entire* range. Edge-avoidance would
+slow recovery. Once the system returns to TRACK, boundary weighting resumes.
 
 ---
 
-## 8. Integration: How the Pieces Fit Together
+## 6. Contextual Bandit for Gain Adaptation
 
-The complete algorithm is a hierarchical control loop:
+### 6.1 Why Adapt the Gains?
+
+The optimal SPSA gains $(a, c)$ depend on the operating regime:
+
+- **Slow drift, low noise:** Small gains work best — the signal is nearly
+  stationary, so careful steps find the precise optimum without wasting
+  movement.
+- **Fast drift, high noise:** Large gains are needed — the optimum is moving,
+  so the controller must track aggressively despite the noise.
+
+Since the drift regime changes over time (e.g., a calm morning followed by a
+vibrating afternoon), a fixed gain is always suboptimal for some conditions.
+The controller needs to *learn* which gains work best for the current regime.
+
+### 6.2 The Contextual Bandit Framework
+
+A **contextual bandit** is a repeated decision problem:
+
+1. Observe the **context** (what are the current drift and noise conditions?).
+2. Choose an **arm** (which gain profile to use).
+3. Receive a **reward** (how well did that profile work?).
+4. Update the estimate for that (context, arm) pair.
+
+The challenge is the **exploration-exploitation dilemma**: should we use the
+arm that has worked best so far (exploitation), or try a different arm that
+might be better (exploration)? UCB1 resolves this with a mathematical
+guarantee of near-optimal performance.
+
+### 6.3 Context: What Information Drives the Choice?
+
+The context is two-dimensional:
+
+- **Drift rate** $\hat{d}$: How fast is the optimum moving? Estimated as the
+  EMA of the mean gradient magnitude $\frac{1}{4}\sum_i |\hat{g}_i|$. If the
+  gradients are large, the optimum is shifting quickly.
+- **Noise level** $\hat{\sigma}_n$: How noisy is the measurement? (From §2.4.)
+
+These are discretized into 6 buckets (3 drift levels × 2 noise levels):
 
 ```mermaid
 flowchart TD
-    RAW["Raw power reading y_t"] --> EMA["Dual EMA<br/>y_fast (τ_f), y_slow (τ_s)"]
+    D["Drift rate d̂"] --> DL{"d̂ < low?"}
+    DL -- Yes --> D0["low"]
+    DL -- No --> DH{"d̂ > high?"}
+    DH -- Yes --> D2["high"]
+    DH -- No --> D1["mid"]
+
+    N["Noise σ̂"] --> NH{"σ̂ > threshold?"}
+    NH -- No --> N0["low"]
+    NH -- Yes --> N1["high"]
+
+    D0 --> B0["Bucket 0<br/>low drift + low noise"]
+    D0 --> B1["Bucket 1<br/>low drift + high noise"]
+    D1 --> B2["Bucket 2<br/>mid drift + low noise"]
+    D1 --> B3["Bucket 3<br/>mid drift + high noise"]
+    D2 --> B4["Bucket 4<br/>high drift + low noise"]
+    D2 --> B5["Bucket 5<br/>high drift + high noise"]
+    N0 --> B0
+    N1 --> B1
+    N0 --> B2
+    N1 --> B3
+    N0 --> B4
+    N1 --> B5
+```
+
+Each bucket maintains its own independent statistics for the 4 arms.
+
+### 6.4 UCB1: Balancing Exploration and Exploitation
+
+The **UCB1** algorithm (Auer, Cesa-Bianchi, Fischer, 2002) selects the arm
+that maximizes:
+
+$$\text{score}(a) = \underbrace{Q(b, a)}_{\text{exploitation}} + \underbrace{C \sqrt{\frac{\ln(N+1)}{n(b,a)+1}}}_{\text{exploration bonus}}$$
+
+where:
+- $Q(b, a)$: the average reward observed for arm $a$ in bucket $b$ (how well
+  has it done historically?).
+- $n(b, a)$: how many times arm $a$ has been tried in bucket $b$.
+- $N$: total number of pulls in bucket $b$.
+- $C$: exploration constant (e.g., 2.0).
+
+**Intuition:** The first term favors arms that have worked well (exploitation).
+The second term is large for arms that have been tried *rarely* — it decreases
+as $n(b,a)$ grows, so it pushes the controller to try under-explored arms.
+As an arm is tried more, its exploration bonus shrinks, and the controller
+settles on the best one. UCB1 guarantees that the cumulative regret grows
+only logarithmically: $R_T = O(\log T)$.
+
+**Example:** After 100 pulls in bucket 0:
+
+| Arm | $Q$ (avg reward) | $n$ (pulls) | Exploration bonus | Score |
+|-----|-------------------|-------------|-------------------|-------|
+| 0 | 20.0 | 60 | $2\sqrt{\ln(101)/61} \approx 0.55$ | 20.55 |
+| 1 | 18.0 | 25 | $2\sqrt{\ln(101)/26} \approx 0.84$ | 18.84 |
+| 2 | 21.0 | 10 | $2\sqrt{\ln(101)/11} \approx 1.30$ | 22.30 ← selected |
+| 3 | 15.0 | 5 | $2\sqrt{\ln(101)/6} \approx 1.77$ | 16.77 |
+
+Arm 2 is selected: it has both a high average reward (21.0) and hasn't been
+tried much (only 10 times), so there's still uncertainty about its true value.
+Arm 0 has the second-highest reward (20.0) but has been tried 60 times — the
+exploration bonus is small, suggesting we're fairly confident it's not the
+best.
+
+### 6.5 Reward Design
+
+The reward is computed as the average over a window of $W = 50$ SPSA cycles
+(~22 seconds):
+
+$$r = \underbrace{\overline{y_{\text{slow}}}}_{\substack{\text{sustained}\\\text{power}}} - \lambda \cdot \underbrace{\overline{f_{\text{boundary}}}}_{\substack{\text{edge}\\\text{proximity}}} - \mu \cdot \underbrace{\overline{\Delta\theta}}_{\substack{\text{actuator}\\\text{movement}}}$$
+
+| Term | What it measures | Why it matters |
+|------|-----------------|----------------|
+| $\overline{y_{\text{slow}}}$ | Mean smoothed power | Primary goal: maximize power |
+| $f_{\text{boundary}}$ | Fraction of sections in the edge zone | Penalize operating near rails (wastes dynamic range) |
+| $\Delta\theta$ | Total voltage movement $\sum_i |\Delta\theta_i|$ | Penalize excessive actuator churn (introduces phase noise) |
+
+This multi-objective reward encodes the physical trade-off: high power is the
+primary goal, but not at the cost of rattling the actuator or operating at the
+rails.
+
+### 6.6 Credit Assignment
+
+The arm is selected **once per SPSA cycle** (at the start), and remains fixed
+for the entire 450 ms cycle. The reward is attributed to the (context, arm)
+pair that was active during the window.
+
+In SEARCH mode, the bandit is **not updated** — the SEARCH gain override was
+in effect, not the bandit's chosen arm. Updating the bandit with rewards from
+a policy it didn't choose would contaminate the Q-table.
+
+---
+
+## 7. Integration: How the Pieces Fit Together
+
+```mermaid
+flowchart TD
+    RAW["Raw power reading"] --> EMA["Dual EMA<br/>y_fast (8 ms), y_slow (75 ms)"]
     EMA --> CEIL["Adaptive ceiling B<br/>(asymmetric tracker)"]
-    EMA --> SIG["Noise sigma σ̂<br/>(EMA of |y − y_slow|)"]
+    EMA --> SIG["Noise sigma σ̂<br/>(updated only in dead-zone)"]
     CEIL --> Z["Z-score<br/>z = (B − y_slow) / σ̂"]
     SIG --> Z
 
-    Z --> FSM["FSM<br/>TRACK / SEARCH / RECOVERY"]
+    Z --> FSM["State machine<br/>TRACK / SEARCH / RECOVERY"]
     EMA --> FADE["Sudden-fade detector<br/>y_fast ≪ y_slow?"]
     FADE --> FSM
 
-    FSM --> |"z > k₁ or SEARCH"| TRIG["Trigger SPSA"]
-    FSM --> |"z ≤ k₁ (dead-zone)"| HOLD["Hold actuator<br/>update σ̂ only"]
+    FSM -->|"z > 2.5σ or SEARCH"| TRIG["Trigger SPSA cycle"]
+    FSM -->|"z ≤ 2.5σ (dead-zone)"| HOLD["Hold actuator<br/>update σ̂ only"]
 
-    TRIG --> BANDIT["Contextual bandit<br/>select (a, c) profile"]
+    TRIG --> BANDIT["Bandit selects<br/>gain profile (a, c)"]
     BANDIT --> SPSA["SPSA cycle<br/>probe +, measure, probe −, measure, update θ"]
-    SPSA --> REWARD["Accumulate reward<br/>(power, boundary, movement)"]
-    REWARD --> |"every W cycles"| BANDIT2["Update Q-values"]
-    BANDIT2 --> BANDIT
+    SPSA --> REWARD["Accumulate reward<br/>over 50 cycles"]
+    REWARD -->|"every ~22 s"| BANDIT_UPD["Update bandit Q-values"]
+    BANDIT_UPD --> BANDIT
 
-    SPSA --> ACT["Output θ to actuator"]
-    HOLD --> ACT2["Hold θ"]
+    SPSA --> ACT["Output new θ to actuator"]
+    HOLD --> ACT2["Hold θ (no movement)"]
 ```
 
 ### Timing
 
-Each SPSA cycle takes $2 \times 3\tau_s + 3 \approx 6\tau_s$ time units (two
-settling periods plus three transition steps). With $\tau_s = 75$ ms, this is
-~453 ms per cycle. The bandit is updated every $W = 50$ cycles (~22.5 s).
+| Timescale | What happens |
+|-----------|-------------|
+| 1 ms | Every sample: update EMAs, compute z-score, update FSM |
+| ~8 ms | $y_{\text{fast}}$ detects a sudden drop |
+| ~75 ms | $y_{\text{slow}}$ settles to a new level |
+| ~225 ms | SPSA probe settling (3× slow EMA for 95% convergence) |
+| ~450 ms | One complete SPSA cycle (probe +, settle, probe −, settle, update) |
+| ~30 s | Periodic probe (if in dead-zone); ceiling leaks ~1 dBm |
+| ~22 s | Bandit update window (50 SPSA cycles) |
 
 The FSM runs every sample (1 ms), continuously monitoring for degradation
 even while an SPSA cycle is in progress. A sudden fade can interrupt the
 current cycle and force SEARCH on the next trigger.
 
-### Hierarchy of Adaptation Timescales
+### Hierarchy of Adaptation
 
-| Component | Timescale | What it adapts |
-|-----------|-----------|----------------|
-| Fast EMA | $\tau_f \approx 8$ ms | Signal tracking (fade detection) |
-| Slow EMA | $\tau_s \approx 75$ ms | SPSA measurement (noise rejection) |
-| Noise sigma | $\sim\tau_s$ | Dead-zone threshold (scale-invariant) |
-| Adaptive ceiling (rise) | 1 step | Immediate trust of improvements |
-| Adaptive ceiling (fall) | ~30 s/dBm | Slow tracking of degradation |
-| SPSA cycle | ~450 ms | Voltage optimization |
-| Bandit update | ~22 s | Gain profile selection |
-| Drift estimate | $\sim\tau_s$ | Bandit context (drift level) |
+The system adapts at multiple timescales simultaneously:
 
-This layered structure allows the controller to react at the appropriate
-timescale for each phenomenon: fast enough to catch sudden fades within
-milliseconds, slow enough to avoid chasing noise.
+```mermaid
+graph TB
+    subgraph "Millisecond scale"
+        F["Fast EMA<br/>Fade detection"]
+    end
+    subgraph "100 ms scale"
+        S["Slow EMA<br/>Noise rejection"]
+        Z["Z-score<br/>Degradation detection"]
+    end
+    subgraph "Second scale"
+        SP["SPSA cycle<br/>Voltage optimization"]
+        D["Drift estimate<br/>Bandit context"]
+    end
+    subgraph "10-second scale"
+        B["Bandit update<br/>Gain profile learning"]
+        C["Ceiling leak<br/>Channel degradation tracking"]
+    end
+
+    F --> S --> Z --> SP --> B
+    SP --> D --> B
+    Z --> C
+```
+
+This layered structure lets the controller react at the appropriate speed for
+each phenomenon: fast enough to catch sudden fades within milliseconds, slow
+enough to avoid chasing noise, and patient enough to learn which gains work
+best over tens of seconds.
 
 ---
 
-## 9. Summary of Design Choices
+## 8. Summary of Design Choices
 
-1. **No hardcoded dBm thresholds.** All decisions are based on the z-score,
-   which is normalized by the estimated noise sigma. The system adapts to
-   whatever power level and noise regime it encounters.
+1. **No hardcoded dBm thresholds.** All decisions use the z-score, normalized
+   by the estimated noise sigma. The system adapts to whatever power level and
+   noise regime it encounters.
 
 2. **Asymmetric ceiling tracker.** Improvements are trusted immediately;
    degradations must prove themselves over ~30 seconds. This distinguishes
@@ -534,10 +686,9 @@ milliseconds, slow enough to avoid chasing noise.
    optimizer from getting stuck. Disabled during SEARCH for aggressive
    recovery.
 
-5. **Contextual bandit for gain adaptation.** The UCB1 policy with a 6-bucket
-   context (drift × noise) selects from 4 gain profiles, adapting the
-   optimizer's aggressiveness to the current regime. Logarithmic regret
-   guarantee.
+5. **Contextual bandit for gain adaptation.** UCB1 with a 6-bucket context
+   (drift × noise) selects from 4 gain profiles, adapting the optimizer's
+   aggressiveness to the current regime. Logarithmic regret guarantee.
 
 6. **Multi-objective reward.** The bandit optimizes not just power, but also
    penalizes actuator movement and edge operation — encoding the physical
